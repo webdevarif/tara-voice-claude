@@ -1,0 +1,138 @@
+{
+  "name": "tara-vscode",
+  "displayName": "Tara — Voice AI Coding Assistant",
+  "description": "Voice-controlled AI coding assistant powered by Gemini Live + Claude Code",
+  "version": "0.1.0",
+  "publisher": "tara",
+  "author": "Tara",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/webdevarif/tara-voice-claude.git"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["AI", "Other"],
+  "keywords": ["voice", "ai", "claude", "gemini", "coding assistant"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "icon": "media/tara-icon.png",
+  "contributes": {
+    "commands": [
+      {
+        "command": "tara.openChat",
+        "title": "Tara: Open Chat Panel",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "tara.startVoice",
+        "title": "Tara: Start Voice Input",
+        "icon": "$(mic)"
+      },
+      {
+        "command": "tara.stopAgent",
+        "title": "Tara: Stop Current Agent",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "tara.openKanban",
+        "title": "Tara: Open Kanban Board",
+        "icon": "$(project)"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "tara-sidebar",
+          "title": "Tara",
+          "icon": "media/tara-sidebar-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "tara-sidebar": [
+        {
+          "type": "webview",
+          "id": "tara.chatView",
+          "name": "Chat"
+        },
+        {
+          "type": "webview",
+          "id": "tara.kanbanView",
+          "name": "Kanban"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Tara",
+      "properties": {
+        "tara.geminiApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Your Gemini API key for voice STT/TTS (Gemini 2.0 Flash Live)"
+        },
+        "tara.claudeCodePath": {
+          "type": "string",
+          "default": "claude",
+          "description": "Path to the claude CLI binary (defaults to 'claude' in PATH)"
+        },
+        "tara.maxConcurrentAgents": {
+          "type": "number",
+          "default": 3,
+          "description": "Maximum number of concurrent Claude Code sub-agents"
+        },
+        "tara.voiceMode": {
+          "type": "string",
+          "enum": ["push-to-talk", "disabled"],
+          "default": "push-to-talk",
+          "description": "Voice input mode"
+        },
+        "tara.riskConfirmation": {
+          "type": "boolean",
+          "default": true,
+          "description": "Require voice/text confirmation before executing risky commands (delete, drop, force push)"
+        }
+      }
+    },
+    "keybindings": [
+      {
+        "command": "tara.startVoice",
+        "key": "ctrl+shift+space",
+        "mac": "cmd+shift+space",
+        "when": "tara.chatViewFocused"
+      },
+      {
+        "command": "tara.stopAgent",
+        "key": "ctrl+shift+.",
+        "mac": "cmd+shift+.",
+        "when": "tara.agentRunning"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "npm run build:extension && npm run build:webview",
+    "build:extension": "tsc -p ./tsconfig.json",
+    "build:webview": "cd webview-ui && npm run build",
+    "watch": "tsc -watch -p ./tsconfig.json",
+    "watch:webview": "cd webview-ui && npm run dev",
+    "compile": "tsc -p ./tsconfig.json",
+    "lint": "eslint src --ext ts",
+    "package": "vsce package",
+    "install:all": "npm install && cd webview-ui && npm install"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^7.0.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "eslint": "^8.57.0",
+    "typescript": "^5.4.0",
+    "@vscode/vsce": "^2.24.0"
+  },
+  "dependencies": {
+    "ws": "^8.17.0",
+    "@types/ws": "^8.5.10"
+  }
+}

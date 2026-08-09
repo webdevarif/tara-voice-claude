@@ -1,0 +1,32 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "type": "npm",
+      "script": "build:extension",
+      "group": "build",
+      "label": "npm: build:extension",
+      "presentation": {
+        "reveal": "silent",
+        "panel": "shared"
+      },
+      "problemMatcher": ["$tsc"]
+    },
+    {
+      "type": "npm",
+      "script": "watch",
+      "group": "build",
+      "label": "npm: watch",
+      "isBackground": true,
+      "problemMatcher": ["$tsc-watch"]
+    },
+    {
+      "type": "npm",
+      "script": "watch:webview",
+      "group": "build",
+      "label": "npm: watch:webview",
+      "isBackground": true,
+      "problemMatcher": []
+    }
+  ]
+}
