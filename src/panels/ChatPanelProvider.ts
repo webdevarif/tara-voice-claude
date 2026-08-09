@@ -168,6 +168,26 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         break;
       }
 
+      case 'CHECK_SETUP': {
+        await this.runSetupCheck();
+        break;
+      }
+
+      case 'SAVE_API_KEY': {
+        const { key } = msg.payload as { key: string };
+        await vscode.workspace
+          .getConfiguration('tara')
+          .update('geminiApiKey', key, vscode.ConfigurationTarget.Global);
+        await this.runSetupCheck();
+        break;
+      }
+
+      case 'OPEN_URL': {
+        const { url } = msg.payload as { url: string };
+        vscode.env.openExternal(vscode.Uri.parse(url));
+        break;
+      }
+
       case 'STOP_AGENT': {
         const { agentId } = msg.payload as { agentId?: string };
         if (agentId) {
@@ -215,6 +235,34 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     this.history.push(entry);
     this.postMessage({ type: 'AGENT_OUTPUT', payload: { type: 'system', text } });
   }
+
+  // ── Setup check: Gemini key + Claude CLI ────────────────────────────────
+  private async runSetupCheck() {
+    const config = vscode.workspace.getConfiguration('tara');
+    const geminiKey = !!config.get<string>('geminiApiKey');
+
+    let claudeInstalled = false;
+    let claudeVersion = '';
+
+    try {
+      const claudePath = config.get<string>('claudeCodePath') || 'claude';
+      const { execSync } = require('child_process');
+      const out = execSync(`${claudePath} --version`, {
+        encoding: 'utf-8',
+        timeout: 5000,
+      }).trim();
+      claudeInstalled = true;
+      claudeVersion = out;
+    } catch {
+      claudeInstalled = false;
+    }
+
+    this.postMessage({
+      type: 'SETUP_STATUS',
+      payload: { geminiKey, claudeInstalled, claudeVersion },
+    });
+  }
+
 
   private async executeCommand(prompt: string) {
     const riskCheck = vscode.workspace

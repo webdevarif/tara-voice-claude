@@ -25,6 +25,9 @@ export type TaraMessageType =
   | 'CONFIRM_EXECUTION'      // user confirmed risky command
   | 'CANCEL_EXECUTION'       // user cancelled risky command
   | 'OPEN_SETTINGS'          // user clicked settings gear
+  | 'CHECK_SETUP'            // webview requests setup status check
+  | 'SAVE_API_KEY'           // webview sends gemini API key to save
+  | 'OPEN_URL'               // webview asks extension to open a URL
   // Extension → Webview
   | 'TRANSCRIPT_TOKEN'       // streaming STT token
   | 'TRANSCRIPT_DONE'        // full transcript finalized
@@ -36,6 +39,7 @@ export type TaraMessageType =
   | 'KANBAN_UPDATE'          // full kanban board state
   | 'ERROR'                  // error message to display
   | 'INIT'                   // initial state on panel load
+  | 'SETUP_STATUS'           // extension reports setup check results
 
 export interface ChatEntry {
   id: string;

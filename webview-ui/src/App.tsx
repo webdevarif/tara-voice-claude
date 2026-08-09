@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { postToExtension, onExtensionMessage } from './vscode-api';
+import { SetupScreen } from './components/SetupScreen';
 import { VoiceOrb } from './components/VoiceOrb';
 import { ChatBubble } from './components/ChatBubble';
 import { StatusIndicator } from './components/StatusIndicator';
@@ -20,6 +21,10 @@ interface AgentState {
 }
 
 export default function App() {
+  // ── Setup gate ──────────────────────────────────────────────────────────
+  const [setupDone, setSetupDone] = useState(false);
+
+  // ── Chat state (only used after setup) ─────────────────────────────────
   const [history, setHistory] = useState<ChatEntry[]>([]);
   const [textInput, setTextInput] = useState('');
   const [agentState, setAgentState] = useState<AgentState>({ status: 'idle', activeAgents: [] });
@@ -179,7 +184,6 @@ export default function App() {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
 
-      // Wire up Web Audio analyser for real-time orb animation
       const ctx = new AudioContext();
       audioContextRef.current = ctx;
       const source = ctx.createMediaStreamSource(stream);
@@ -189,7 +193,6 @@ export default function App() {
       source.connect(analyser);
       setAnalyserNode(analyser);
 
-      // MediaRecorder for sending audio to extension host
       const recorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
       mediaRecorderRef.current = recorder;
 
@@ -235,6 +238,16 @@ export default function App() {
     appendMessage({ role: 'system', content: '⏹ Agent stopped.' });
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  RENDER
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // ── Setup gate: show setup screen until all checks pass ────────────────
+  if (!setupDone) {
+    return <SetupScreen onComplete={() => setSetupDone(true)} />;
+  }
+
+  // ── Main chat UI ──────────────────────────────────────────────────────────
   return (
     <div className="tara-app">
       {/* Header */}
@@ -263,31 +276,10 @@ export default function App() {
       <div className="tara-chat">
         {history.length === 0 && (
           <div className="tara-empty">
-            <div className="tara-empty-orb-preview">
-              <svg viewBox="0 0 60 60" width="60" height="60">
-                <circle cx="30" cy="30" r="18" fill="#111318" stroke="#5b5fc7" strokeWidth="1"/>
-                <circle cx="30" cy="30" r="26" fill="none" stroke="#22242e" strokeWidth="1" strokeDasharray="3 5"/>
-                <path d="M26 24h8v6a4 4 0 0 1-8 0z" fill="none" stroke="#5b5fc7" strokeWidth="1.5" strokeLinecap="round"/>
-                <path d="M24 30a6 6 0 0 0 12 0" fill="none" stroke="#5b5fc7" strokeWidth="1.5" strokeLinecap="round"/>
-                <line x1="30" y1="36" x2="30" y2="39" stroke="#5b5fc7" strokeWidth="1.5" strokeLinecap="round"/>
-                <line x1="27" y1="39" x2="33" y2="39" stroke="#5b5fc7" strokeWidth="1.5" strokeLinecap="round"/>
-              </svg>
-            </div>
-            <span className="tara-empty-label">Tara is ready</span>
-            <div className="tara-empty-steps">
-              <div className="tara-empty-step">
-                <span className="tara-empty-step-num">1</span>
-                <span>Set your <strong>Gemini API key</strong> in settings ⚙</span>
-              </div>
-              <div className="tara-empty-step">
-                <span className="tara-empty-step-num">2</span>
-                <span>Install <code>claude</code> CLI — <code>npm i -g @anthropic-ai/claude-code</code></span>
-              </div>
-              <div className="tara-empty-step">
-                <span className="tara-empty-step-num">3</span>
-                <span>Hold the orb below to speak a command</span>
-              </div>
-            </div>
+            <span className="tara-empty-label">Ready</span>
+            <p className="tara-empty-sub">
+              Hold the orb to speak, or type a command below.
+            </p>
           </div>
         )}
 
@@ -321,7 +313,7 @@ export default function App() {
         />
       )}
 
-      {/* Voice orb — the main interaction element */}
+      {/* Voice orb */}
       <VoiceOrb
         isListening={isListening}
         onStart={handleVoiceStart}
