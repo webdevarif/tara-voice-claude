@@ -236,17 +236,20 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     this.postMessage({ type: 'AGENT_OUTPUT', payload: { type: 'system', text } });
   }
 
-  // ── Setup check: Gemini key + Claude CLI ────────────────────────────────
+  // ── Setup check: Gemini key + Claude CLI + Auth ──────────────────────────
   private async runSetupCheck() {
     const config = vscode.workspace.getConfiguration('tara');
     const geminiKey = !!config.get<string>('geminiApiKey');
 
     let claudeInstalled = false;
     let claudeVersion = '';
+    let claudeAuthed = false;
 
+    const claudePath = config.get<string>('claudeCodePath') || 'claude';
+    const { execSync } = require('child_process');
+
+    // Check installed
     try {
-      const claudePath = config.get<string>('claudeCodePath') || 'claude';
-      const { execSync } = require('child_process');
       const out = execSync(`${claudePath} --version`, {
         encoding: 'utf-8',
         timeout: 5000,
@@ -257,9 +260,30 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       claudeInstalled = false;
     }
 
+    // Check auth (only if installed)
+    if (claudeInstalled) {
+      try {
+        const authOut = execSync(`${claudePath} auth status`, {
+          encoding: 'utf-8',
+          timeout: 5000,
+          stdio: ['pipe', 'pipe', 'pipe'],
+        }).trim();
+        // If it returns without error and contains 'authenticated' or 'Logged in', it's good
+        claudeAuthed = authOut.toLowerCase().includes('authenticated')
+          || authOut.toLowerCase().includes('logged in')
+          || authOut.toLowerCase().includes('active');
+      } catch (e: unknown) {
+        // auth status might exit non-zero if not logged in
+        // Check stderr/stdout for hints
+        const errMsg = e instanceof Error ? e.message : '';
+        claudeAuthed = errMsg.toLowerCase().includes('authenticated')
+          || errMsg.toLowerCase().includes('logged in');
+      }
+    }
+
     this.postMessage({
       type: 'SETUP_STATUS',
-      payload: { geminiKey, claudeInstalled, claudeVersion },
+      payload: { geminiKey, claudeInstalled, claudeVersion, claudeAuthed },
     });
   }
 

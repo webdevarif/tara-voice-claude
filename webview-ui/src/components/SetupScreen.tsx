@@ -5,6 +5,7 @@ interface SetupStatus {
   geminiKey: boolean;
   claudeInstalled: boolean;
   claudeVersion?: string;
+  claudeAuthed?: boolean;
 }
 
 interface SetupScreenProps {
@@ -19,18 +20,21 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
   const [apiKeyStatus, setApiKeyStatus] = useState<ItemStatus>('pending');
 
   const [micStatus, setMicStatus] = useState<MicStatus>('unknown');
+  const [micDevices, setMicDevices] = useState<MediaDeviceInfo[]>([]);
+  const [selectedMicId, setSelectedMicId] = useState<string>('');
 
   const [claudeStatus, setClaudeStatus] = useState<ItemStatus>('checking');
   const [claudeVersion, setClaudeVersion] = useState('');
+  const [claudeAuthed, setClaudeAuthed] = useState(false);
 
   const allDone =
-    apiKeyStatus === 'ok' && micStatus === 'granted' && claudeStatus === 'ok';
+    apiKeyStatus === 'ok' && micStatus === 'granted' && claudeStatus === 'ok' && claudeAuthed;
 
   // ── Listen for setup status from extension host ───────────────────────────
   useEffect(() => {
     const cleanup = onExtensionMessage((msg) => {
       if (msg.type === 'SETUP_STATUS') {
-        const { geminiKey, claudeInstalled, claudeVersion: cv } =
+        const { geminiKey, claudeInstalled, claudeVersion: cv, claudeAuthed: ca } =
           msg.payload as SetupStatus;
         if (geminiKey) setApiKeyStatus('ok');
         if (claudeInstalled) {
@@ -39,6 +43,7 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
         } else {
           setClaudeStatus('error');
         }
+        setClaudeAuthed(!!ca);
       }
     });
     // Request status check on mount
@@ -67,17 +72,45 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
     setApiKey('');
   }
 
-  // ── Request mic ───────────────────────────────────────────────────────────
+  // ── Request mic + enumerate devices ────────────────────────────────────
   async function handleRequestMic() {
     setMicStatus('checking');
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       stream.getTracks().forEach((t) => t.stop());
       setMicStatus('granted');
+      await enumerateDevices();
     } catch {
       setMicStatus('denied');
     }
   }
+
+  async function enumerateDevices() {
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const audioInputs = devices.filter((d) => d.kind === 'audioinput' && d.deviceId);
+      setMicDevices(audioInputs);
+      if (audioInputs.length > 0 && !selectedMicId) {
+        const defaultDev = audioInputs.find((d) => d.deviceId === 'default') || audioInputs[0];
+        setSelectedMicId(defaultDev.deviceId);
+        postToExtension({ type: 'SET_MIC_DEVICE', payload: { deviceId: defaultDev.deviceId } });
+      }
+    } catch {
+      // fallback — permission might not be fully granted yet
+    }
+  }
+
+  function handleMicSelect(deviceId: string) {
+    setSelectedMicId(deviceId);
+    postToExtension({ type: 'SET_MIC_DEVICE', payload: { deviceId } });
+  }
+
+  // Auto-enumerate if permission already granted on mount
+  useEffect(() => {
+    if (micStatus === 'granted') {
+      enumerateDevices();
+    }
+  }, [micStatus]);
 
   return (
     <div className="setup-screen">
@@ -161,7 +194,26 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
             </button>
           )}
           {micStatus === 'granted' && (
-            <p className="setup-card-ok-msg">✓ Microphone access granted</p>
+            <div className="setup-mic-granted">
+              <p className="setup-card-ok-msg">✓ Microphone access granted</p>
+              {micDevices.length > 0 && (
+                <div className="setup-mic-select-wrap">
+                  <label className="setup-mic-select-label" htmlFor="setup-mic-select">Input device</label>
+                  <select
+                    id="setup-mic-select"
+                    className="setup-select"
+                    value={selectedMicId}
+                    onChange={(e) => handleMicSelect(e.target.value)}
+                  >
+                    {micDevices.map((dev, i) => (
+                      <option key={dev.deviceId} value={dev.deviceId}>
+                        {dev.label || `Microphone ${i + 1}`}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+            </div>
           )}
           {micStatus === 'denied' && (
             <p className="setup-card-error-msg">
@@ -171,18 +223,51 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
         </div>
 
         {/* 3 — Claude CLI */}
-        <div className={`setup-card ${claudeStatus === 'ok' ? 'card-ok' : claudeStatus === 'error' ? 'card-error' : ''}`}>
+        <div className={`setup-card ${claudeStatus === 'ok' && claudeAuthed ? 'card-ok' : claudeStatus === 'error' ? 'card-error' : (claudeStatus === 'ok' && !claudeAuthed) ? 'card-warn' : ''}`}>
           <div className="setup-card-header">
             <span className="setup-card-icon">🤖</span>
             <div className="setup-card-title-wrap">
               <span className="setup-card-title">Claude Code CLI</span>
               <span className="setup-card-desc">Executes AI tasks in your workspace</span>
             </div>
-            <StatusBadge status={claudeStatus} />
+            <StatusBadge status={claudeStatus === 'ok' && claudeAuthed ? 'ok' : claudeStatus === 'ok' && !claudeAuthed ? 'error' : claudeStatus} />
           </div>
-          {claudeStatus === 'ok' && (
-            <p className="setup-card-ok-msg">✓ Detected — {claudeVersion}</p>
+
+          {/* Installed + Authed */}
+          {claudeStatus === 'ok' && claudeAuthed && (
+            <p className="setup-card-ok-msg">✓ {claudeVersion} — authenticated</p>
           )}
+
+          {/* Installed but NOT logged in */}
+          {claudeStatus === 'ok' && !claudeAuthed && (
+            <div className="setup-card-action setup-card-action-col">
+              <p className="setup-card-ok-msg">✓ Detected — {claudeVersion}</p>
+              <p className="setup-card-warn-msg">⚠ Not logged in — run in terminal:</p>
+              <div className="setup-code-block">
+                <code>claude auth</code>
+                <button
+                  id="setup-copy-auth-btn"
+                  className="setup-copy-btn"
+                  onClick={() => navigator.clipboard.writeText('claude auth')}
+                  title="Copy"
+                >
+                  ⎘
+                </button>
+              </div>
+              <button
+                id="setup-recheck-auth-btn"
+                className="setup-btn setup-btn-ghost"
+                onClick={() => {
+                  setClaudeStatus('checking');
+                  postToExtension({ type: 'CHECK_SETUP', payload: {} });
+                }}
+              >
+                Re-check
+              </button>
+            </div>
+          )}
+
+          {/* Not installed */}
           {claudeStatus === 'error' && (
             <div className="setup-card-action setup-card-action-col">
               <p className="setup-card-error-msg">✕ Not found in PATH</p>
@@ -197,6 +282,7 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
                   ⎘
                 </button>
               </div>
+              <p className="setup-card-hint">Then run <code className="setup-inline-code">claude auth</code> to log in</p>
               <button
                 id="setup-recheck-claude-btn"
                 className="setup-btn setup-btn-ghost"
@@ -209,6 +295,7 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
               </button>
             </div>
           )}
+
           {claudeStatus === 'checking' && (
             <p className="setup-checking-msg">Detecting claude CLI…</p>
           )}

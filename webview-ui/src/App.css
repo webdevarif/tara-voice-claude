@@ -88,6 +88,34 @@
   background: rgba(224,82,82,0.04);
 }
 
+.setup-card.card-warn {
+  border-color: rgba(227,160,43,0.4);
+  background: rgba(227,160,43,0.04);
+}
+
+.setup-card-warn-msg {
+  font-size: var(--text-xs);
+  color: var(--amber);
+  font-weight: 500;
+  line-height: 1.5;
+}
+
+.setup-card-hint {
+  font-size: var(--text-xs);
+  color: var(--text-3);
+  line-height: 1.5;
+}
+
+.setup-inline-code {
+  font-family: var(--mono);
+  font-size: 10px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  padding: 1px 4px;
+  border-radius: 3px;
+  color: var(--accent-hi);
+}
+
 .setup-card-header {
   display: flex;
   align-items: flex-start;
@@ -283,6 +311,55 @@
 @keyframes readyPulse {
   0%, 100% { box-shadow: 0 0 0 0 rgba(91,95,199,0); }
   50%       { box-shadow: 0 0 0 4px rgba(91,95,199,0.2); }
+}
+
+/* Mic device selector */
+.setup-mic-granted {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.setup-mic-select-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.setup-mic-select-label {
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+
+.setup-select {
+  width: 100%;
+  background: var(--bg-base);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  padding: 5px var(--sp-2);
+  color: var(--text-1);
+  font-size: var(--text-xs);
+  font-family: var(--font);
+  outline: none;
+  cursor: pointer;
+  transition: border-color 0.2s ease;
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%234a4d60'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  padding-right: 24px;
+}
+
+.setup-select:focus { border-color: var(--accent-dim); }
+.setup-select:hover { border-color: var(--border-mid); }
+
+.setup-select option {
+  background: var(--bg-surface);
+  color: var(--text-1);
 }
 
 

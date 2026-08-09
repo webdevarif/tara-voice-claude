@@ -28,6 +28,7 @@ export type TaraMessageType =
   | 'CHECK_SETUP'            // webview requests setup status check
   | 'SAVE_API_KEY'           // webview sends gemini API key to save
   | 'OPEN_URL'               // webview asks extension to open a URL
+  | 'SET_MIC_DEVICE'          // webview tells extension which mic device to use
   // Extension → Webview
   | 'TRANSCRIPT_TOKEN'       // streaming STT token
   | 'TRANSCRIPT_DONE'        // full transcript finalized
