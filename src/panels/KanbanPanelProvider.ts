@@ -1,4 +1,6 @@
 import * as vscode from 'vscode';
+import * as fs from 'fs';
+import * as path from 'path';
 import { AgentOrchestrator } from '../execution/AgentOrchestrator';
 import { TaraMessage, KanbanBoard } from '../types';
 
@@ -27,6 +29,7 @@ export class KanbanPanelProvider implements vscode.WebviewViewProvider {
       localResourceRoots: [
         vscode.Uri.joinPath(this.context.extensionUri, 'media'),
         vscode.Uri.joinPath(this.context.extensionUri, 'webview-ui', 'dist'),
+        vscode.Uri.joinPath(this.context.extensionUri, 'webview-ui'),
       ],
     };
 
@@ -62,9 +65,8 @@ export class KanbanPanelProvider implements vscode.WebviewViewProvider {
     const scriptUri = webview.asWebviewUri(
       vscode.Uri.joinPath(distPath, 'assets', 'kanban.js')
     );
-    const styleUri = webview.asWebviewUri(
-      vscode.Uri.joinPath(distPath, 'assets', 'index.css')
-    );
+    // Dynamically find the CSS file
+    const cssUri = this.findCssUri(webview, distPath);
     const nonce = getNonce();
 
     return /* html */ `<!DOCTYPE html>
@@ -75,17 +77,33 @@ export class KanbanPanelProvider implements vscode.WebviewViewProvider {
   <meta http-equiv="Content-Security-Policy" content="
     default-src 'none';
     style-src ${webview.cspSource} 'unsafe-inline';
-    script-src 'nonce-${nonce}';
+    script-src 'nonce-${nonce}' ${webview.cspSource};
     font-src ${webview.cspSource} https://fonts.gstatic.com;
   "/>
-  <link rel="stylesheet" href="${styleUri}" />
+  ${cssUri ? `<link rel="stylesheet" href="${cssUri}" />` : ''}
   <title>Tara Kanban</title>
 </head>
 <body>
   <div id="kanban-root"></div>
-  <script nonce="${nonce}" src="${scriptUri}"></script>
+  <script type="module" nonce="${nonce}" src="${scriptUri}"></script>
 </body>
 </html>`;
+  }
+
+  private findCssUri(webview: vscode.Webview, distPath: vscode.Uri): string | null {
+    try {
+      const assetsPath = path.join(distPath.fsPath, 'assets');
+      const files = fs.readdirSync(assetsPath);
+      const cssFile = files.find((f) => f.endsWith('.css'));
+      if (cssFile) {
+        return webview.asWebviewUri(
+          vscode.Uri.joinPath(distPath, 'assets', cssFile)
+        ).toString();
+      }
+    } catch {
+      // dist not built yet
+    }
+    return null;
   }
 }
 

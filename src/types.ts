@@ -24,6 +24,7 @@ export type TaraMessageType =
   | 'STOP_AGENT'             // user clicked stop
   | 'CONFIRM_EXECUTION'      // user confirmed risky command
   | 'CANCEL_EXECUTION'       // user cancelled risky command
+  | 'OPEN_SETTINGS'          // user clicked settings gear
   // Extension → Webview
   | 'TRANSCRIPT_TOKEN'       // streaming STT token
   | 'TRANSCRIPT_DONE'        // full transcript finalized

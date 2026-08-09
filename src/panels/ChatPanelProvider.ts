@@ -1,9 +1,9 @@
 import * as vscode from 'vscode';
-import * as path from 'path';
-import * as fs from 'fs';
 import { AgentOrchestrator } from '../execution/AgentOrchestrator';
 import { GeminiVoiceBridge } from '../voice/GeminiVoiceBridge';
 import { TaraMessage, ChatEntry, isRiskyCommand } from '../types';
+import * as fs from 'fs';
+import * as path from 'path';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ChatPanelProvider — Webview panel for the Tara chat UI
@@ -33,10 +33,11 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       localResourceRoots: [
         vscode.Uri.joinPath(this.context.extensionUri, 'media'),
         vscode.Uri.joinPath(this.context.extensionUri, 'webview-ui', 'dist'),
+        vscode.Uri.joinPath(this.context.extensionUri, 'webview-ui'),
       ],
     };
 
-    webviewView.webview.html = this.getHtml(webviewView.webview);
+    webviewView.webview.html = this.buildHtml(webviewView.webview);
 
     // Handle messages from webview
     webviewView.webview.onDidReceiveMessage(
@@ -53,6 +54,10 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         webviewView.visible
       );
     });
+
+    // Settings button in panel toolbar
+    webviewView.title = 'Chat';
+    webviewView.description = '';
 
     // Send initial state
     this.postMessage({ type: 'INIT', payload: { history: this.history } });
@@ -155,6 +160,14 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         break;
       }
 
+      case 'OPEN_SETTINGS': {
+        vscode.commands.executeCommand(
+          'workbench.action.openSettings',
+          '@ext:tara.tara-vscode'
+        );
+        break;
+      }
+
       case 'STOP_AGENT': {
         const { agentId } = msg.payload as { agentId?: string };
         if (agentId) {
@@ -242,7 +255,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
 
   // ── HTML ───────────────────────────────────────────────────────────────────
 
-  private getHtml(webview: vscode.Webview): string {
+  private buildHtml(webview: vscode.Webview): string {
     const distPath = vscode.Uri.joinPath(
       this.context.extensionUri,
       'webview-ui',
@@ -251,9 +264,8 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     const scriptUri = webview.asWebviewUri(
       vscode.Uri.joinPath(distPath, 'assets', 'index.js')
     );
-    const styleUri = webview.asWebviewUri(
-      vscode.Uri.joinPath(distPath, 'assets', 'index.css')
-    );
+    // Find the actual CSS file (Vite may name it differently)
+    const cssUri = this.findCssUri(webview, distPath);
     const nonce = getNonce();
 
     return /* html */ `<!DOCTYPE html>
@@ -264,19 +276,35 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   <meta http-equiv="Content-Security-Policy" content="
     default-src 'none';
     style-src ${webview.cspSource} 'unsafe-inline';
-    script-src 'nonce-${nonce}';
+    script-src 'nonce-${nonce}' ${webview.cspSource};
     connect-src wss: https:;
     media-src 'self' blob:;
     font-src ${webview.cspSource} https://fonts.gstatic.com;
   "/>
-  <link rel="stylesheet" href="${styleUri}" />
+  ${cssUri ? `<link rel="stylesheet" href="${cssUri}" />` : ''}
   <title>Tara</title>
 </head>
 <body>
   <div id="root"></div>
-  <script nonce="${nonce}" src="${scriptUri}"></script>
+  <script type="module" nonce="${nonce}" src="${scriptUri}"></script>
 </body>
 </html>`;
+  }
+
+  private findCssUri(webview: vscode.Webview, distPath: vscode.Uri): string | null {
+    try {
+      const assetsPath = path.join(distPath.fsPath, 'assets');
+      const files = fs.readdirSync(assetsPath);
+      const cssFile = files.find((f) => f.endsWith('.css'));
+      if (cssFile) {
+        return webview.asWebviewUri(
+          vscode.Uri.joinPath(distPath, 'assets', cssFile)
+        ).toString();
+      }
+    } catch {
+      // dist not built yet
+    }
+    return null;
   }
 }
 

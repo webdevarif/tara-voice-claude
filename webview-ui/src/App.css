@@ -120,6 +120,37 @@ body::before {
   flex-shrink: 0;
 }
 
+.tara-header-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.tara-settings-btn {
+  width: 22px;
+  height: 22px;
+  background: none;
+  border: none;
+  color: var(--text-3);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--r-sm);
+  transition: color 0.15s ease, background 0.15s ease;
+  padding: 3px;
+  cursor: pointer;
+}
+
+.tara-settings-btn svg {
+  width: 13px;
+  height: 13px;
+}
+
+.tara-settings-btn:hover {
+  color: var(--text-1);
+  background: var(--bg-raised);
+}
+
 .tara-logo {
   display: flex;
   align-items: center;
@@ -195,24 +226,72 @@ body::before {
   align-items: center;
   justify-content: center;
   flex: 1;
-  gap: var(--sp-2);
-  padding: var(--sp-6);
+  gap: var(--sp-3);
+  padding: var(--sp-4);
   text-align: center;
+}
+
+.tara-empty-orb-preview {
+  opacity: 0.7;
+  margin-bottom: var(--sp-1);
 }
 
 .tara-empty-label {
   font-size: var(--text-xs);
-  font-weight: 600;
+  font-weight: 700;
   letter-spacing: 2px;
   text-transform: uppercase;
-  color: var(--text-3);
+  color: var(--text-2);
 }
 
-.tara-empty-sub {
+.tara-empty-steps {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  width: 100%;
+  margin-top: var(--sp-1);
+}
+
+.tara-empty-step {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  text-align: left;
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
   font-size: var(--text-sm);
-  color: var(--text-3);
-  line-height: 1.6;
-  max-width: 180px;
+  color: var(--text-2);
+  line-height: 1.5;
+}
+
+.tara-empty-step strong { color: var(--text-1); font-weight: 600; }
+.tara-empty-step code {
+  font-family: var(--mono);
+  font-size: 10px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  padding: 1px 4px;
+  border-radius: 3px;
+  color: var(--accent-hi);
+  white-space: nowrap;
+}
+
+.tara-empty-step-num {
+  min-width: 18px;
+  height: 18px;
+  background: var(--accent-muted);
+  border: 1px solid var(--accent-dim);
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 9px;
+  font-weight: 700;
+  color: var(--accent-hi);
+  flex-shrink: 0;
+  margin-top: 1px;
 }
 
 /* ── Chat bubbles ────────────────────────────────────────────────────────── */

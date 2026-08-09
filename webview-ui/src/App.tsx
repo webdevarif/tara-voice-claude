@@ -243,17 +243,51 @@ export default function App() {
           <span className="tara-logo-dot" />
           <span className="tara-logo-text">Tara</span>
         </div>
-        <StatusIndicator status={agentState.status} />
+        <div className="tara-header-actions">
+          <StatusIndicator status={agentState.status} />
+          <button
+            id="tara-settings-btn"
+            className="tara-settings-btn"
+            title="Open Tara Settings"
+            aria-label="Settings"
+            onClick={() => postToExtension({ type: 'OPEN_SETTINGS', payload: {} })}
+          >
+            <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+              <path d="M9.1 0L8 .9l-.4 1.4a5.3 5.3 0 0 0-1.2.7L5 2.6 3.6 3.4l.4 1.4a5.5 5.5 0 0 0-.7 1.2L2 6.4v1.2l1.4.4c.2.4.4.8.7 1.2L3.7 10l.8 1.4 1.4-.4c.4.3.8.5 1.2.7l.4 1.4h1.2l.4-1.4c.4-.2.8-.4 1.2-.7l1.4.4.8-1.4-.4-1.4c.3-.4.5-.8.7-1.2l1.4-.4V6.4l-1.4-.4a5.5 5.5 0 0 0-.7-1.2l.4-1.4L11.4 2l-1.4.4A5.3 5.3 0 0 0 8.8 2L8.4 0H9.1zM8 5.5a2.5 2.5 0 1 1 0 5 2.5 2.5 0 0 1 0-5z"/>
+            </svg>
+          </button>
+        </div>
       </div>
 
       {/* Chat */}
       <div className="tara-chat">
         {history.length === 0 && (
           <div className="tara-empty">
-            <span className="tara-empty-label">Voice AI Coding</span>
-            <p className="tara-empty-sub">
-              Hold the orb to speak. Type below to send a command.
-            </p>
+            <div className="tara-empty-orb-preview">
+              <svg viewBox="0 0 60 60" width="60" height="60">
+                <circle cx="30" cy="30" r="18" fill="#111318" stroke="#5b5fc7" strokeWidth="1"/>
+                <circle cx="30" cy="30" r="26" fill="none" stroke="#22242e" strokeWidth="1" strokeDasharray="3 5"/>
+                <path d="M26 24h8v6a4 4 0 0 1-8 0z" fill="none" stroke="#5b5fc7" strokeWidth="1.5" strokeLinecap="round"/>
+                <path d="M24 30a6 6 0 0 0 12 0" fill="none" stroke="#5b5fc7" strokeWidth="1.5" strokeLinecap="round"/>
+                <line x1="30" y1="36" x2="30" y2="39" stroke="#5b5fc7" strokeWidth="1.5" strokeLinecap="round"/>
+                <line x1="27" y1="39" x2="33" y2="39" stroke="#5b5fc7" strokeWidth="1.5" strokeLinecap="round"/>
+              </svg>
+            </div>
+            <span className="tara-empty-label">Tara is ready</span>
+            <div className="tara-empty-steps">
+              <div className="tara-empty-step">
+                <span className="tara-empty-step-num">1</span>
+                <span>Set your <strong>Gemini API key</strong> in settings ⚙</span>
+              </div>
+              <div className="tara-empty-step">
+                <span className="tara-empty-step-num">2</span>
+                <span>Install <code>claude</code> CLI — <code>npm i -g @anthropic-ai/claude-code</code></span>
+              </div>
+              <div className="tara-empty-step">
+                <span className="tara-empty-step-num">3</span>
+                <span>Hold the orb below to speak a command</span>
+              </div>
+            </div>
           </div>
         )}
 
