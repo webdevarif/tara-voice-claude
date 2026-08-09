@@ -51,18 +51,9 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
     return cleanup;
   }, []);
 
-  // ── Mic permission check ──────────────────────────────────────────────────
-  useEffect(() => {
-    navigator.permissions
-      .query({ name: 'microphone' as PermissionName })
-      .then((result) => {
-        setMicStatus(result.state === 'granted' ? 'granted' : result.state === 'denied' ? 'denied' : 'unknown');
-        result.onchange = () => {
-          setMicStatus(result.state === 'granted' ? 'granted' : result.state === 'denied' ? 'denied' : 'unknown');
-        };
-      })
-      .catch(() => setMicStatus('unknown'));
-  }, []);
+  // ── Mic: don't use navigator.permissions.query (broken in VS Code webview)
+  // Instead, always show the Grant button; denied only if getUserMedia throws.
+
 
   // ── Save API key ──────────────────────────────────────────────────────────
   function handleSaveKey() {
@@ -216,9 +207,23 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
             </div>
           )}
           {micStatus === 'denied' && (
-            <p className="setup-card-error-msg">
-              ✕ Permission denied — allow microphone in your browser/OS settings and reload VS Code
-            </p>
+            <div className="setup-card-action setup-card-action-col">
+              <p className="setup-card-error-msg">
+                ✕ Microphone access was blocked
+              </p>
+              <p className="setup-card-hint">
+                Allow microphone in your browser/OS settings, then try again.
+              </p>
+              <button
+                id="setup-mic-retry-btn"
+                className="setup-btn setup-btn-ghost"
+                onClick={() => {
+                  setMicStatus('unknown');
+                }}
+              >
+                Try again
+              </button>
+            </div>
           )}
         </div>
 
