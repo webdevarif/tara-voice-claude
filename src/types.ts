@@ -29,6 +29,7 @@ export type TaraMessageType =
   | 'SAVE_API_KEY'           // webview sends gemini API key to save
   | 'OPEN_URL'               // webview asks extension to open a URL
   | 'SET_MIC_DEVICE'          // webview tells extension which mic device to use
+  | 'OPEN_MIC_SETTINGS'       // webview asks extension to open VS Code mic settings
   // Extension → Webview
   | 'TRANSCRIPT_TOKEN'       // streaming STT token
   | 'TRANSCRIPT_DONE'        // full transcript finalized

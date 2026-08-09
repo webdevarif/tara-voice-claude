@@ -188,6 +188,14 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         break;
       }
 
+      case 'OPEN_MIC_SETTINGS': {
+        vscode.commands.executeCommand(
+          'workbench.action.openSettings',
+          'microphone'
+        );
+        break;
+      }
+
       case 'STOP_AGENT': {
         const { agentId } = msg.payload as { agentId?: string };
         if (agentId) {

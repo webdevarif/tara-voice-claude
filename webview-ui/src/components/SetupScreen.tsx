@@ -211,15 +211,17 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
               <p className="setup-card-error-msg">
                 ✕ Microphone access was blocked
               </p>
-              <p className="setup-card-hint">
-                Allow microphone in your browser/OS settings, then try again.
-              </p>
+              <button
+                id="setup-mic-settings-btn"
+                className="setup-btn setup-btn-primary"
+                onClick={() => postToExtension({ type: 'OPEN_MIC_SETTINGS', payload: {} })}
+              >
+                Open Microphone Settings
+              </button>
               <button
                 id="setup-mic-retry-btn"
                 className="setup-btn setup-btn-ghost"
-                onClick={() => {
-                  setMicStatus('unknown');
-                }}
+                onClick={() => setMicStatus('unknown')}
               >
                 Try again
               </button>
