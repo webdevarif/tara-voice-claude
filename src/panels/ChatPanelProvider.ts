@@ -10,10 +10,13 @@ import {
 import {
   GEMINI_OUTPUT_SAMPLE_RATE,
   GeminiVoiceBridge,
+  LOOK_TOOL,
   LiveToolCall,
+  OPEN_BROWSER_TOOL,
   RUN_TASK_TOOL,
   VoiceState,
 } from '../voice/GeminiVoiceBridge';
+import { captureScreenJpeg, frameMimeType, probeScreenCapture } from '../voice/ScreenCapture';
 import {
   AudioInputDevice,
   CaptureBackend,
@@ -542,10 +545,14 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       announced = true;
       const model = config.get<string>('geminiLiveModel') || 'default';
       const lang = config.get<string>('language', 'auto');
+      const eyes = probeScreenCapture();
       this.addSystemMessage(
         `Live session open — speech-to-speech, ${model}, ` +
           `language ${lang === 'auto' ? 'auto-detect' : lang}. ` +
-          'Tara answers you directly; Claude Code runs only when she calls for it.'
+          'Tara answers you directly; Claude Code runs only when she calls for it. ' +
+          (eyes.ok
+            ? `She can open links in the editor's browser and look at the screen (${eyes.detail}).`
+            : `She cannot see the screen: ${eyes.detail}`)
       );
     });
     bridge.on('languageCodeDropped', (why: string) => {
@@ -1142,7 +1149,86 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
    * win over the old design, where dispatch waited for a transcript that only
    * finalized once a discarded spoken answer had finished generating.
    */
+  /**
+   * Opens a URL in the editor's own browser tab.
+   *
+   * `simpleBrowser.show` is contributed by the built-in simple-browser extension,
+   * which ships with VS Code and with every fork on this machine (Cursor, Devin,
+   * Trae — all verified to carry it). Awaited rather than fired and forgotten: the
+   * model's next move is almost always to look at the page, and that must not
+   * happen before the tab exists.
+   */
+  private async openInBrowser(rawUrl: string): Promise<string> {
+    const url = rawUrl.trim();
+    // http and https only. The model chooses this string, and a `file:` or
+    // `command:` URI is a way to reach things a web page should not.
+    if (!/^https?:\/\/[^\s]+$/i.test(url)) {
+      throw new Error(`"${url}" is not an http or https URL.`);
+    }
+    try {
+      await vscode.commands.executeCommand('simpleBrowser.show', url);
+      return url;
+    } catch {
+      // Missing only in a stripped-down build. The system browser still lets the
+      // user see the page, and the caller says which one happened.
+      await vscode.env.openExternal(vscode.Uri.parse(url));
+      return `${url} (in your system browser — this editor has no built-in one)`;
+    }
+  }
+
+  /**
+   * Takes a screenshot and puts it in front of the model.
+   *
+   * The image does not travel back as the tool's return value — a function
+   * response carries JSON, not media. It goes up as `realtimeInput.video`, which
+   * is user content, and the response only reports that it was sent. The ordering
+   * matters: frame first, acknowledgement second, or the model answers about a
+   * picture it has not received.
+   */
+  private async lookAtScreen(bridge: GeminiVoiceBridge): Promise<string> {
+    const shot = await captureScreenJpeg();
+    const sent = bridge.sendVideoFrame(shot.base64, frameMimeType(shot.base64));
+    if (!sent) {
+      throw new Error('The Live session was not open, so the screenshot went nowhere.');
+    }
+    const kb = Math.round(shot.bytes / 1024);
+    this.addSystemMessage(`👁 Sent a screenshot to Tara (${kb} KB, via ${shot.via}).`);
+    return `Screenshot sent (${kb} KB). It is in front of you now — describe what you actually see.`;
+  }
+
   private handleToolCall(bridge: GeminiVoiceBridge, call: LiveToolCall, epoch: number) {
+    const ref = { id: call.id, name: call.name, epoch };
+
+    if (call.name === OPEN_BROWSER_TOOL) {
+      const url = typeof call.args.url === 'string' ? call.args.url : '';
+      void this.openInBrowser(url).then(
+        (opened) => {
+          this.addSystemMessage(`🌐 Opened ${opened}`);
+          bridge.sendToolResponse(ref, { result: `Opened ${opened}` }, 'SILENT');
+        },
+        (err: unknown) => {
+          const message = err instanceof Error ? err.message : String(err);
+          bridge.sendToolResponse(ref, { error: message });
+        }
+      );
+      return;
+    }
+
+    if (call.name === LOOK_TOOL) {
+      void this.lookAtScreen(bridge).then(
+        // SILENT: the frame is already on its way as user content and the model
+        // will speak about the image itself. INTERRUPT here would make it announce
+        // the acknowledgement instead of the answer.
+        (note) => bridge.sendToolResponse(ref, { result: note }, 'SILENT'),
+        (err: unknown) => {
+          const message = err instanceof Error ? err.message : String(err);
+          this.addSystemMessage(`✕ Could not take a screenshot: ${message}`);
+          bridge.sendToolResponse(ref, { error: message });
+        }
+      );
+      return;
+    }
+
     if (call.name !== RUN_TASK_TOOL) {
       bridge.sendToolResponse(
         { id: call.id, name: call.name, epoch },

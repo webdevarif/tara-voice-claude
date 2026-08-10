@@ -95,8 +95,12 @@ const WS_OPEN = 1;
 /** Audio the server returns is always 24 kHz signed 16-bit LE mono. */
 export const GEMINI_OUTPUT_SAMPLE_RATE = 24000;
 
-/** The one tool the model has. Claude Code is what actually touches the repo. */
+/** Hands work to Claude Code, which is what actually touches the repo. */
 export const RUN_TASK_TOOL = 'run_coding_task';
+/** Opens a URL in the editor's built-in browser, so both of us can see it. */
+export const OPEN_BROWSER_TOOL = 'open_in_browser';
+/** Captures the screen and shows it to the model. */
+export const LOOK_TOOL = 'look_at_screen';
 
 /**
  * `NON_BLOCKING` is the whole reason this design works. A coding task runs for
@@ -127,6 +131,47 @@ const TOOL_DECLARATION = {
           },
         },
         required: ['task'],
+      },
+    },
+    {
+      name: OPEN_BROWSER_TOOL,
+      // Blocking, unlike the coding task: opening a tab takes milliseconds, and
+      // the model's very next move is usually to look at it, which must not
+      // happen before the page is there.
+      description:
+        "Open a URL in the editor's built-in browser, in a tab beside the code. " +
+        'Use this whenever a page needs checking — a local dev server, a preview, ' +
+        'a deployed site, documentation. The user sees the same tab you do. Follow ' +
+        `it with ${LOOK_TOOL} to actually see the page.`,
+      parameters: {
+        type: 'OBJECT',
+        properties: {
+          url: {
+            type: 'STRING',
+            description:
+              'The full URL, including http:// or https://. A localhost address ' +
+              'such as http://localhost:3000 is fine.',
+          },
+        },
+        required: ['url'],
+      },
+    },
+    {
+      name: LOOK_TOOL,
+      description:
+        'Take a screenshot of the screen and look at it. Use this to check a page ' +
+        'you just opened, to see a layout the user is describing, to read an error ' +
+        'on screen, or any time the user says "look", "see this", or "what is wrong ' +
+        'with this". The image arrives as part of the conversation, so describe what ' +
+        'you actually see rather than guessing.',
+      parameters: {
+        type: 'OBJECT',
+        properties: {
+          reason: {
+            type: 'STRING',
+            description: 'What you are looking for, in a few words.',
+          },
+        },
       },
     },
   ],
@@ -486,6 +531,27 @@ export class GeminiVoiceBridge extends EventEmitter {
     // timer so the turn finalizes as soon as the user stops talking.
     this.send({ realtimeInput: { audioStreamEnd: true } });
     this.emit('listeningStop');
+  }
+
+  /**
+   * Sends one image frame for the model to look at.
+   *
+   * `realtimeInput.video` is the right key even for a single still: video and audio
+   * are siblings under realtimeInput, and a frame put anywhere else — inside the
+   * audio object, or as inlineData — is accepted by the socket and then quietly
+   * ignored by the model, which is the worst failure mode available to a feature
+   * whose whole point is that she can see.
+   *
+   * Not queued through `pending` when disconnected: a stale screenshot replayed
+   * after a reconnect would have the model describing something no longer on
+   * screen. A dropped frame can simply be taken again.
+   */
+  sendVideoFrame(base64: string, mimeType = 'image/jpeg'): boolean {
+    if (!base64 || !this.setupDone || this.ws?.readyState !== WS_OPEN) {
+      return false;
+    }
+    this.ws.send(JSON.stringify({ realtimeInput: { video: { data: base64, mimeType } } }));
+    return true;
   }
 
   /** base64-encoded signed 16-bit LE mono PCM at `inputSampleRate`. */
