@@ -698,12 +698,55 @@ body::before {
   to   { opacity: 1; transform: translateY(0); }
 }
 
+/* A row is avatar + bubble. Alignment lives here rather than on the bubble,
+   because the pair has to move together; `.tara-chat` is a flex column, which is
+   what makes align-self work. */
+.chat-row {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--sp-2);
+  max-width: 100%;
+  min-width: 0;
+}
+
 /* Sent messages sit on the right, replies on the left — the arrangement every
-   chat client uses, so who said what is readable without reading the label.
-   `.tara-chat` is a flex column, which is what makes align-self work here. */
-.bubble-user {
+   chat client uses, so who said what is readable without reading the label. */
+.row-user {
   align-self: flex-end;
-  max-width: 85%;
+  max-width: 88%;
+  /* Reversed rather than reordered, so the avatar ends up beside the bubble's
+     tail on both sides. */
+  flex-direction: row-reverse;
+}
+
+.row-agent {
+  align-self: flex-start;
+  max-width: 94%;
+}
+
+.row-system {
+  align-self: center;
+  max-width: 100%;
+}
+
+.chat-avatar {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  object-fit: cover;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  /* Sits level with the bubble's last line rather than floating above it. */
+  margin-bottom: 1px;
+}
+
+.chat-avatar-empty {
+  border-color: transparent;
+  background: transparent;
+}
+
+.bubble-user {
   background: var(--bubble-user-bg);
   border-color: var(--bubble-user-border);
   /* Square corner on the bottom right: the bubble's "tail", pointing at the
@@ -713,10 +756,14 @@ body::before {
 
 .bubble-claude,
 .bubble-tara {
-  align-self: flex-start;
-  max-width: 92%;
   /* Mirrored tail, so the two sides read as a conversation. */
   border-radius: var(--r-md) var(--r-md) var(--r-md) 2px;
+}
+
+/* min-width:0 lets a long unbroken token shrink the bubble instead of pushing
+   the row wider than its max-width. */
+.chat-row > .chat-bubble {
+  min-width: 0;
 }
 
 .bubble-claude {
@@ -742,12 +789,23 @@ body::before {
 }
 
 .bubble-system {
-  align-self: center;
   background: transparent;
   border: none;
   padding: 2px var(--sp-2);
   align-items: center;
   text-align: center;
+}
+
+/* Grows to fill whatever room is left, so a short conversation rests on the
+   input bar and grows upward — the way a chat window behaves.
+
+   Deliberately a spacer rather than `justify-content: flex-end` on the
+   scroller: with flex-end, once the content overflows, the overflowing top is
+   unreachable in several engines. A flex-grow child collapses to zero height
+   instead, leaving normal scrolling intact. */
+.tara-chat-spacer {
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
 .bubble-system-text {

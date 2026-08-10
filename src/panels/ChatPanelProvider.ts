@@ -1018,6 +1018,15 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       vscode.Uri.joinPath(distPath, 'assets', 'index.js')
     );
     const cssUri = findCssUri(webview, distPath);
+    // Avatars are bundled rather than hotlinked: the CSP allows `img-src` only
+    // from cspSource and data:, so a remote URL would simply be blocked — and
+    // Vite copies `public/` through un-hashed, so these names stay stable.
+    const avatars = {
+      me: webview.asWebviewUri(vscode.Uri.joinPath(distPath, 'avatar-me.png')).toString(),
+      claude: webview
+        .asWebviewUri(vscode.Uri.joinPath(distPath, 'avatar-claude.png'))
+        .toString(),
+    };
     const nonce = getNonce();
 
     return /* html */ `<!DOCTYPE html>
@@ -1039,6 +1048,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
 </head>
 <body>
   <div id="root"></div>
+  <script nonce="${nonce}">window.__taraAvatars = ${JSON.stringify(avatars)};</script>
   <script type="module" nonce="${nonce}" src="${scriptUri}"></script>
 </body>
 </html>`;

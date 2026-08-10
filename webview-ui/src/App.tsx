@@ -375,6 +375,10 @@ export default function App() {
           </div>
         )}
 
+        {/* Pushes a short conversation down to the input bar. Only when there is
+            something to push: the empty state reads better where it is. */}
+        {history.length > 0 && <div className="tara-chat-spacer" />}
+
         {history.map((entry) => (
           <ChatBubble key={entry.id} entry={entry} />
         ))}
