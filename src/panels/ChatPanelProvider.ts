@@ -130,7 +130,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     this.store = new ConversationStore(
       vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? ''
     );
-    this.history = this.store.load().slice();
+    this.history = this.store.entriesForActive().slice();
 
     // Every chunk is examined locally; only some of them are sent on.
     this.recorder.on('data', (chunk: Buffer) => this.handleAudioChunk(chunk));
@@ -225,11 +225,20 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     this.viewDisposables = [];
   }
 
+  private postSessions() {
+    this.postMessage({
+      type: 'SESSIONS',
+      payload: { sessions: this.store.listSessions(), activeId: this.store.activeId },
+    });
+  }
+
   private async postInit() {
     this.postMessage({
       type: 'INIT',
       payload: {
         history: this.history,
+        sessions: this.store.listSessions(),
+        activeSessionId: this.store.activeId,
         setupComplete: this.context.globalState.get<boolean>(STATE_SETUP_COMPLETE, false),
         micDeviceId: this.context.globalState.get<string>(STATE_MIC_DEVICE, ''),
         agentStatus: this.orchestrator.aggregateStatus(),
@@ -780,6 +789,62 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         // A postMessage sent before the webview's script has subscribed is
         // dropped, so the webview asks for its state once it is listening.
         await this.postInit();
+        break;
+      }
+
+      case 'LIST_SESSIONS': {
+        this.postSessions();
+        break;
+      }
+
+      case 'NEW_SESSION': {
+        this.store.createSession();
+        this.history = [];
+        // Any agent still running belongs to the session being left; its output
+        // would otherwise land in the new one as if it had been asked there.
+        this.orchestrator.stopAll();
+        await this.postInit();
+        this.postSessions();
+        break;
+      }
+
+      case 'OPEN_SESSION': {
+        const { id } = msg.payload as { id?: string };
+        const entries = id ? this.store.openSession(id) : undefined;
+        if (!entries) {
+          break;
+        }
+        this.history = entries.slice();
+        this.orchestrator.stopAll();
+        await this.postInit();
+        this.postSessions();
+        break;
+      }
+
+      case 'RENAME_SESSION': {
+        const { id, title } = msg.payload as { id?: string; title?: string };
+        if (id && typeof title === 'string') {
+          this.store.renameSession(id, title);
+          this.postSessions();
+        }
+        break;
+      }
+
+      case 'DELETE_SESSION': {
+        const { id } = msg.payload as { id?: string };
+        if (!id) {
+          break;
+        }
+        const wasActive = id === this.store.activeId;
+        this.store.deleteSession(id);
+        if (wasActive) {
+          // deleteSession always leaves one active, so this is never empty by
+          // accident — the panel is never left with no session at all.
+          this.history = this.store.entriesForActive().slice();
+          this.orchestrator.stopAll();
+          await this.postInit();
+        }
+        this.postSessions();
         break;
       }
 

@@ -19,6 +19,11 @@ export type TaraMessageType =
   // Webview → Extension
   | 'WEBVIEW_READY'           // webview has subscribed and wants its initial state
   | 'SET_MIC_ENABLED'         // user switched hands-free listening on or off
+  | 'LIST_SESSIONS'           // webview asks for this project's session list
+  | 'NEW_SESSION'             // start a fresh conversation in this project
+  | 'OPEN_SESSION'            // switch to a stored conversation
+  | 'RENAME_SESSION'          // give a conversation a name of one's own
+  | 'DELETE_SESSION'          // remove a conversation and its transcript
   | 'SEND_COMMAND'            // text command submitted from chat input
   | 'REPLY_TO_AGENT'          // answer to a clarifying question from an agent
   | 'STOP_AGENT'              // user clicked stop
@@ -36,6 +41,7 @@ export type TaraMessageType =
   | 'INSTALL_FFMPEG'          // webview asks for the ffmpeg install command in a terminal
   | 'SETUP_COMPLETE'          // webview reports setup finished; persist it
   // Extension → Webview
+  | 'SESSIONS'                // this project's conversations, newest first
   | 'USER_MESSAGE'            // a user entry the host recorded (typed or dictated)
   | 'TRANSCRIPT_TOKEN'        // streaming STT token
   | 'TRANSCRIPT_DONE'         // full transcript finalized

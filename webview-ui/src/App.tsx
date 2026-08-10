@@ -4,6 +4,8 @@ import { PcmPlayer } from './audio';
 import { SetupScreen } from './components/SetupScreen';
 import { VoiceOrb } from './components/VoiceOrb';
 import type { MicState } from './components/VoiceOrb';
+import { SessionList } from './components/SessionList';
+import type { SessionMeta } from './components/SessionList';
 import { ChatBubble } from './components/ChatBubble';
 import { StatusIndicator } from './components/StatusIndicator';
 import { ConfirmDialog } from './components/ConfirmDialog';
@@ -43,6 +45,9 @@ export default function App() {
    */
   const [micState, setMicState] = useState<MicState>('off');
   const [confirmRequest, setConfirmRequest] = useState<{ message: string } | null>(null);
+  const [sessions, setSessions] = useState<SessionMeta[]>([]);
+  const [activeSessionId, setActiveSessionId] = useState('');
+  const [showSessions, setShowSessions] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   // Keyed by agent id: with up to `tara.maxConcurrentAgents` running, a single
@@ -149,13 +154,18 @@ export default function App() {
         case 'INIT': {
           const payload = msg.payload as {
             history?: ChatEntry[];
+            sessions?: SessionMeta[];
+            activeSessionId?: string;
             setupComplete?: boolean;
             agentStatus?: AgentStatus;
             awaitingInput?: boolean;
           };
-          if (payload.history?.length) {
-            setHistory(payload.history);
-          }
+          // Always replaced, never merged: INIT is also how a session switch
+          // arrives, and switching to an empty one has to clear the view.
+          setHistory(payload.history ?? []);
+          streamingByAgentRef.current.clear();
+          setSessions(payload.sessions ?? []);
+          setActiveSessionId(payload.activeSessionId ?? '');
           setSetupDone(!!payload.setupComplete);
           if (payload.agentStatus) {
             setAgentStatus(payload.agentStatus);
@@ -238,6 +248,16 @@ export default function App() {
 
         case 'TTS_DONE':
           break;
+
+        case 'SESSIONS': {
+          const { sessions: list, activeId } = msg.payload as {
+            sessions?: SessionMeta[];
+            activeId?: string;
+          };
+          setSessions(list ?? []);
+          setActiveSessionId(activeId ?? '');
+          break;
+        }
 
         case 'USER_MESSAGE': {
           // The host is the single source of truth for what the user said —
@@ -357,6 +377,26 @@ export default function App() {
         <div className="tara-header-actions">
           <StatusIndicator status={agentStatus} />
           <button
+            id="tara-sessions-btn"
+            className={`tara-settings-btn ${showSessions ? 'is-active' : ''}`}
+            title="Conversations"
+            aria-label="Conversations"
+            aria-expanded={showSessions}
+            onClick={() => {
+              const next = !showSessions;
+              setShowSessions(next);
+              if (next) {
+                // Refreshed on open rather than kept live: another window may
+                // have added or renamed one since this panel last heard.
+                postToExtension({ type: 'LIST_SESSIONS', payload: {} });
+              }
+            }}
+          >
+            <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+              <path d="M2 3h12v1.6H2V3zm0 4.2h12v1.6H2V7.2zM2 11.4h8V13H2v-1.6z" />
+            </svg>
+          </button>
+          <button
             id="tara-settings-btn"
             className="tara-settings-btn"
             title="Open Tara Settings"
@@ -369,6 +409,26 @@ export default function App() {
           </button>
         </div>
       </div>
+
+      {showSessions && (
+        <SessionList
+          sessions={sessions}
+          activeId={activeSessionId}
+          onNew={() => {
+            postToExtension({ type: 'NEW_SESSION', payload: {} });
+            setShowSessions(false);
+          }}
+          onOpen={(id) => {
+            postToExtension({ type: 'OPEN_SESSION', payload: { id } });
+            setShowSessions(false);
+          }}
+          onRename={(id, title) =>
+            postToExtension({ type: 'RENAME_SESSION', payload: { id, title } })
+          }
+          onDelete={(id) => postToExtension({ type: 'DELETE_SESSION', payload: { id } })}
+          onClose={() => setShowSessions(false)}
+        />
+      )}
 
       <div className="tara-chat">
         {history.length === 0 && (
