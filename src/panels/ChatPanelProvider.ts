@@ -17,6 +17,7 @@ import {
 } from '../voice/MicRecorder';
 import { verifyGeminiKey } from '../voice/GeminiKeyCheck';
 import { Vad } from '../voice/Vad';
+import { ConversationStore } from '../history/ConversationStore';
 import {
   AudioOutputDevice,
   SpeakerPlayer,
@@ -106,6 +107,11 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
    * a silent room from being streamed to — and billed by — the Live API.
    */
   private readonly vad = new Vad();
+  /**
+   * Per-project history, kept outside VS Code's extension storage so that
+   * uninstalling and reinstalling does not erase it. See the module header.
+   */
+  private readonly store: ConversationStore;
   /** Playback, also in this process — see SpeakerPlayer's header for why. */
   private readonly speaker = new SpeakerPlayer();
   /** Cached from the last setup check so a press does not re-probe. */
@@ -119,6 +125,13 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     private readonly context: vscode.ExtensionContext,
     private readonly orchestrator: AgentOrchestrator
   ) {
+    // The first workspace folder identifies the project. A window with no folder
+    // open gets its own bucket rather than borrowing another project's history.
+    this.store = new ConversationStore(
+      vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? ''
+    );
+    this.history = this.store.load().slice();
+
     // Every chunk is examined locally; only some of them are sent on.
     this.recorder.on('data', (chunk: Buffer) => this.handleAudioChunk(chunk));
     this.recorder.on('capturing', () => this.postMicState());
@@ -937,6 +950,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     if (this.history.length > MAX_HISTORY_ENTRIES) {
       this.history.splice(0, this.history.length - MAX_HISTORY_ENTRIES);
     }
+    // Persisted per project, so reopening the folder — even after reinstalling
+    // the extension — shows the conversation that was happening in it.
+    this.store.append(entry);
 
     // Only `user` is echoed. This used to post nothing at all, which is why a
     // dictated command never appeared on screen: typed input showed up solely
@@ -954,7 +970,11 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   }
 
   private handleAgentOutput(agentId: string, data: AgentOutput) {
-    if (data.type === 'text' || data.type === 'result') {
+    // Only the final result is recorded. `text` arrives as streaming fragments,
+    // which the webview renders live from AGENT_OUTPUT; storing each fragment as
+    // its own entry filled the history — and now the history file — with dozens
+    // of partial duplicates of the same answer.
+    if (data.type === 'result') {
       this.addEntry('claude', data.text);
     } else if (data.type === 'error') {
       this.addEntry('system', `✕ ${data.text}`);
@@ -1166,6 +1186,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   }
 
   dispose() {
+    // First: a closing window should not lose the last debounced write.
+    this.store.dispose();
+    this.clearTimers();
     this.disposeViewListeners();
     // Before the bridge, so no chunk is emitted at a disposed listener — and so
     // the devices are released even if the bridge teardown throws.
