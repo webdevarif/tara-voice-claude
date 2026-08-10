@@ -1,5 +1,11 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { postToExtension, onExtensionMessage } from '../vscode-api';
+
+interface AudioInputDevice {
+  id: string;
+  label: string;
+  isDefault?: boolean;
+}
 
 interface SetupStatus {
   geminiKey: boolean;
@@ -7,37 +13,41 @@ interface SetupStatus {
   claudeVersion?: string;
   claudeAuthed?: boolean;
   claudeAuthDetail?: string;
+  ffmpegInstalled?: boolean;
+  ffmpegVersion?: string;
+  ffmpegError?: string;
+  ffmpegInstallCommand?: string;
+  micDevices?: AudioInputDevice[];
+  micDeviceId?: string;
 }
 
 interface SetupScreenProps {
-  initialMicDeviceId?: string;
-  onMicDeviceChange?: (deviceId: string) => void;
   onComplete: () => void;
 }
 
-type MicStatus = 'unknown' | 'checking' | 'granted' | 'denied';
 type ItemStatus = 'pending' | 'ok' | 'error' | 'checking';
 
-export function SetupScreen({
-  initialMicDeviceId,
-  onMicDeviceChange,
-  onComplete,
-}: SetupScreenProps) {
+export function SetupScreen({ onComplete }: SetupScreenProps) {
   const [apiKey, setApiKey] = useState('');
   const [apiKeyStatus, setApiKeyStatus] = useState<ItemStatus>('pending');
 
-  const [micStatus, setMicStatus] = useState<MicStatus>('unknown');
-  const [micDevices, setMicDevices] = useState<MediaDeviceInfo[]>([]);
-  const [selectedMicId, setSelectedMicId] = useState(initialMicDeviceId ?? '');
-  const [micError, setMicError] = useState('');
+  // The microphone check is now "can the extension host reach a capture
+  // device", not "will this document be granted getUserMedia" — the latter is
+  // permanently no in a VS Code webview, so asking was misleading.
+  const [ffmpegStatus, setFfmpegStatus] = useState<ItemStatus>('checking');
+  const [ffmpegVersion, setFfmpegVersion] = useState('');
+  const [ffmpegError, setFfmpegError] = useState('');
+  const [installCommand, setInstallCommand] = useState('');
+  const [micDevices, setMicDevices] = useState<AudioInputDevice[]>([]);
+  const [selectedMicId, setSelectedMicId] = useState('');
 
   const [claudeStatus, setClaudeStatus] = useState<ItemStatus>('checking');
   const [claudeVersion, setClaudeVersion] = useState('');
   const [claudeAuthed, setClaudeAuthed] = useState(false);
   const [claudeAuthDetail, setClaudeAuthDetail] = useState('');
 
-  const allDone =
-    apiKeyStatus === 'ok' && micStatus === 'granted' && claudeStatus === 'ok' && claudeAuthed;
+  const micReady = ffmpegStatus === 'ok' && micDevices.length > 0;
+  const allDone = apiKeyStatus === 'ok' && micReady && claudeStatus === 'ok' && claudeAuthed;
 
   // ── Setup status from the extension host ──────────────────────────────────
   useEffect(() => {
@@ -51,13 +61,17 @@ export function SetupScreen({
       setClaudeVersion(payload.claudeVersion ?? '');
       setClaudeAuthed(!!payload.claudeAuthed);
       setClaudeAuthDetail(payload.claudeAuthDetail ?? '');
+
+      setFfmpegStatus(payload.ffmpegInstalled ? 'ok' : 'error');
+      setFfmpegVersion(payload.ffmpegVersion ?? '');
+      setFfmpegError(payload.ffmpegError ?? '');
+      setInstallCommand(payload.ffmpegInstallCommand ?? '');
+      setMicDevices(payload.micDevices ?? []);
+      setSelectedMicId(payload.micDeviceId ?? '');
     });
     postToExtension({ type: 'CHECK_SETUP', payload: {} });
     return cleanup;
   }, []);
-
-  // navigator.permissions.query('microphone') is unreliable in a VS Code
-  // webview, so the only trustworthy signal is whether getUserMedia resolves.
 
   function handleSaveKey() {
     if (!apiKey.trim()) {
@@ -68,51 +82,14 @@ export function SetupScreen({
     setApiKeyStatus('checking');
   }
 
-  const enumerateDevices = useCallback(
-    async (preferred: string) => {
-      try {
-        const devices = await navigator.mediaDevices.enumerateDevices();
-        const inputs = devices.filter((d) => d.kind === 'audioinput' && d.deviceId);
-        setMicDevices(inputs);
-        if (!inputs.length) {
-          return;
-        }
-        const stillPresent = preferred && inputs.some((d) => d.deviceId === preferred);
-        const chosen = stillPresent
-          ? preferred
-          : (inputs.find((d) => d.deviceId === 'default') ?? inputs[0]).deviceId;
-        setSelectedMicId(chosen);
-        onMicDeviceChange?.(chosen);
-        postToExtension({ type: 'SET_MIC_DEVICE', payload: { deviceId: chosen } });
-      } catch {
-        // Labels are only exposed after a grant; a failure here is not fatal.
-      }
-    },
-    [onMicDeviceChange]
-  );
-
-  async function handleRequestMic() {
-    setMicStatus('checking');
-    setMicError('');
-    try {
-      // Only a real getUserMedia call tells us whether capture is allowed.
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1 },
-      });
-      stream.getTracks().forEach((t) => t.stop());
-      setMicStatus('granted');
-      await enumerateDevices(selectedMicId);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      setMicStatus('denied');
-      setMicError(message);
-    }
-  }
-
   function handleMicSelect(deviceId: string) {
     setSelectedMicId(deviceId);
-    onMicDeviceChange?.(deviceId);
     postToExtension({ type: 'SET_MIC_DEVICE', payload: { deviceId } });
+  }
+
+  function recheckMic() {
+    setFfmpegStatus('checking');
+    postToExtension({ type: 'CHECK_SETUP', payload: {} });
   }
 
   function recheckClaude() {
@@ -185,46 +162,61 @@ export function SetupScreen({
           )}
         </div>
 
-        {/* 2 — Microphone */}
+        {/* 2 — Microphone, captured by ffmpeg in the extension host */}
         <div
           className={`setup-card ${
-            micStatus === 'granted' ? 'card-ok' : micStatus === 'denied' ? 'card-error' : ''
+            micReady ? 'card-ok' : ffmpegStatus === 'error' ? 'card-error' : ''
           }`}
         >
           <div className="setup-card-header">
             <span className="setup-card-icon">🎤</span>
             <div className="setup-card-title-wrap">
-              <span className="setup-card-title">Microphone Access</span>
+              <span className="setup-card-title">Microphone (ffmpeg)</span>
               <span className="setup-card-desc">Required for push-to-talk voice input</span>
             </div>
             <StatusBadge
-              status={
-                micStatus === 'granted'
-                  ? 'ok'
-                  : micStatus === 'denied'
-                    ? 'error'
-                    : micStatus === 'checking'
-                      ? 'checking'
-                      : 'pending'
-              }
+              status={micReady ? 'ok' : ffmpegStatus === 'checking' ? 'checking' : ffmpegStatus}
             />
           </div>
 
-          {micStatus !== 'granted' && micStatus !== 'denied' && (
-            <button
-              id="setup-mic-btn"
-              className="setup-btn setup-btn-primary"
-              onClick={handleRequestMic}
-              disabled={micStatus === 'checking'}
-            >
-              {micStatus === 'checking' ? 'Checking…' : 'Grant Microphone Access'}
-            </button>
+          {ffmpegStatus === 'checking' && <p className="setup-card-hint">Looking for ffmpeg…</p>}
+
+          {ffmpegStatus === 'error' && (
+            <div className="setup-card-action setup-card-action-col">
+              <p className="setup-card-error-msg">✕ ffmpeg not found</p>
+              <p className="setup-card-hint">
+                Tara records through ffmpeg because VS Code does not grant webviews microphone
+                access, so the browser API cannot be used here.
+              </p>
+              {installCommand && (
+                <div className="setup-code-block">
+                  <code>{installCommand}</code>
+                </div>
+              )}
+              <button
+                id="setup-ffmpeg-install-btn"
+                className="setup-btn setup-btn-primary"
+                onClick={() => postToExtension({ type: 'INSTALL_FFMPEG', payload: {} })}
+              >
+                Open a terminal with this command
+              </button>
+              <button
+                id="setup-mic-retry-btn"
+                className="setup-btn setup-btn-ghost"
+                onClick={recheckMic}
+              >
+                Check again
+              </button>
+              {ffmpegError && <p className="setup-card-hint">{ffmpegError}</p>}
+            </div>
           )}
 
-          {micStatus === 'granted' && (
+          {ffmpegStatus === 'ok' && (
             <div className="setup-mic-granted">
-              <p className="setup-card-ok-msg">✓ Microphone access granted</p>
-              {micDevices.length > 0 && (
+              <p className="setup-card-ok-msg">
+                ✓ {ffmpegVersion.replace(/^ffmpeg version /i, '').split(' ')[0] || 'ffmpeg ready'}
+              </p>
+              {micDevices.length > 0 ? (
                 <div className="setup-mic-select-wrap">
                   <label className="setup-mic-select-label" htmlFor="setup-mic-select">
                     Input device
@@ -236,37 +228,24 @@ export function SetupScreen({
                     onChange={(e) => handleMicSelect(e.target.value)}
                   >
                     {micDevices.map((dev, i) => (
-                      <option key={dev.deviceId} value={dev.deviceId}>
+                      <option key={dev.id} value={dev.id}>
                         {dev.label || `Microphone ${i + 1}`}
                       </option>
                     ))}
                   </select>
                 </div>
+              ) : (
+                <div className="setup-card-action setup-card-action-col">
+                  <p className="setup-card-error-msg">✕ No capture device found</p>
+                  <button
+                    id="setup-mic-retry-btn"
+                    className="setup-btn setup-btn-ghost"
+                    onClick={recheckMic}
+                  >
+                    Check again
+                  </button>
+                </div>
               )}
-            </div>
-          )}
-
-          {micStatus === 'denied' && (
-            <div className="setup-card-action setup-card-action-col">
-              <p className="setup-card-error-msg">✕ Microphone access was blocked</p>
-              {micError && <p className="setup-card-hint">{micError}</p>}
-              <button
-                id="setup-mic-settings-btn"
-                className="setup-btn setup-btn-primary"
-                onClick={() => postToExtension({ type: 'OPEN_MIC_SETTINGS', payload: {} })}
-              >
-                Open Microphone Settings
-              </button>
-              <button
-                id="setup-mic-retry-btn"
-                className="setup-btn setup-btn-ghost"
-                onClick={() => {
-                  setMicError('');
-                  setMicStatus('unknown');
-                }}
-              >
-                Try again
-              </button>
             </div>
           )}
         </div>

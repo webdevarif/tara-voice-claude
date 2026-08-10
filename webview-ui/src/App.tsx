@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { postToExtension, onExtensionMessage } from './vscode-api';
-import { MicCapture, PcmPlayer } from './audio';
+import { PcmPlayer } from './audio';
 import { SetupScreen } from './components/SetupScreen';
 import { VoiceOrb } from './components/VoiceOrb';
 import { ChatBubble } from './components/ChatBubble';
@@ -35,36 +35,36 @@ export default function App() {
   const [agentStatus, setAgentStatus] = useState<AgentStatus>('idle');
   const [pendingQuestion, setPendingQuestion] = useState<PendingQuestion | null>(null);
   const [transcriptDraft, setTranscriptDraft] = useState('');
-  const [isListening, setIsListening] = useState(false);
+  /**
+   * 'opening' covers the ~450 ms a capture device takes to start delivering
+   * samples. The UI must not claim to be listening during it, or users start
+   * talking before anything is being recorded.
+   */
+  const [micState, setMicState] = useState<'idle' | 'opening' | 'capturing'>('idle');
   const [confirmRequest, setConfirmRequest] = useState<{ message: string } | null>(null);
-  const [analyserNode, setAnalyserNode] = useState<AnalyserNode | null>(null);
-  const [micDeviceId, setMicDeviceId] = useState('');
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   // Keyed by agent id: with up to `tara.maxConcurrentAgents` running, a single
   // slot merged two agents' output into one bubble.
   const streamingByAgentRef = useRef<Map<string, string>>(new Map());
-  const captureRef = useRef<MicCapture | null>(null);
   const playerRef = useRef<PcmPlayer | null>(null);
   // Read inside callbacks that must not be re-created on every state change.
-  const micDeviceIdRef = useRef('');
-  const isListeningRef = useRef(false);
+  const micStateRef = useRef<'idle' | 'opening' | 'capturing'>('idle');
 
-  micDeviceIdRef.current = micDeviceId;
-  isListeningRef.current = isListening;
+  micStateRef.current = micState;
+  const isListening = micState === 'capturing';
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [history, transcriptDraft]);
 
-  // Long-lived playback context; the capture context is per-utterance.
+  // Long-lived playback context. There is no capture context to tear down here
+  // — the microphone belongs to the extension host, which releases it itself.
   useEffect(() => {
     playerRef.current = new PcmPlayer();
     return () => {
       void playerRef.current?.close();
       playerRef.current = null;
-      void captureRef.current?.stop();
-      captureRef.current = null;
     };
   }, []);
 
@@ -121,53 +121,31 @@ export default function App() {
   }, []);
 
   // ── Voice ─────────────────────────────────────────────────────────────────
+  //
+  // The microphone is opened by the extension host, not here: VS Code builds the
+  // webview iframes without `microphone` in their Permissions-Policy allow list,
+  // so `getUserMedia` is refused in this document regardless of user or OS
+  // consent (microsoft/vscode#250568). Push-to-talk is therefore two messages,
+  // and `micState` comes back from the host — 'opening' until the capture device
+  // is actually delivering samples, which takes ~450 ms.
 
-  const stopCapture = useCallback(async () => {
-    setIsListening(false);
-    setAnalyserNode(null);
-    const capture = captureRef.current;
-    captureRef.current = null;
-    if (capture) {
-      await capture.stop();
+  const handleVoiceStart = useCallback(() => {
+    if (micStateRef.current !== 'idle') {
+      return;
     }
+    setMicState('opening');
+    postToExtension({ type: 'VOICE_START', payload: {} });
   }, []);
 
-  const handleVoiceStart = useCallback(async () => {
-    if (captureRef.current) {
+  const handleVoiceEnd = useCallback(() => {
+    if (micStateRef.current === 'idle') {
       return;
     }
-    const capture = new MicCapture();
-    captureRef.current = capture;
-    try {
-      const { analyser } = await capture.start(micDeviceIdRef.current || undefined, {
-        onChunk: (base64) =>
-          postToExtension({ type: 'VOICE_AUDIO_CHUNK', payload: { base64 } }),
-        onError: (message) => appendMessage({ role: 'system', content: `⚠ ${message}` }),
-      });
-      setAnalyserNode(analyser);
-      setIsListening(true);
-      postToExtension({ type: 'VOICE_START', payload: {} });
-    } catch (err) {
-      captureRef.current = null;
-      await capture.stop();
-      const message = err instanceof Error ? err.message : String(err);
-      const denied = /permission|notallowed|denied/i.test(message);
-      appendMessage({
-        role: 'system',
-        content: denied
-          ? '⚠ Microphone access was blocked. Open VS Code microphone settings and allow it, then try again.'
-          : `⚠ Could not start the microphone: ${message}`,
-      });
-    }
-  }, [appendMessage]);
-
-  const handleVoiceEnd = useCallback(async () => {
-    if (!isListeningRef.current && !captureRef.current) {
-      return;
-    }
-    await stopCapture();
+    // Optimistic, so the button releases instantly; the host confirms with its
+    // own 'idle' once ffmpeg has exited.
+    setMicState('idle');
     postToExtension({ type: 'VOICE_STOP', payload: {} });
-  }, [stopCapture]);
+  }, []);
 
   // ── Extension messages ────────────────────────────────────────────────────
 
@@ -178,7 +156,6 @@ export default function App() {
           const payload = msg.payload as {
             history?: ChatEntry[];
             setupComplete?: boolean;
-            micDeviceId?: string;
             agentStatus?: AgentStatus;
             awaitingInput?: boolean;
           };
@@ -186,7 +163,6 @@ export default function App() {
             setHistory(payload.history);
           }
           setSetupDone(!!payload.setupComplete);
-          setMicDeviceId(payload.micDeviceId ?? '');
           if (payload.agentStatus) {
             setAgentStatus(payload.agentStatus);
           }
@@ -270,9 +246,17 @@ export default function App() {
           break;
 
         case 'VOICE_STATE': {
-          const { state } = msg.payload as { state: string };
+          // Two independent things arrive on this channel: `state` is the Gemini
+          // session, `mic` is the capture device. A frame carries either.
+          const { state, mic } = msg.payload as {
+            state?: string;
+            mic?: 'idle' | 'opening' | 'capturing';
+          };
           if (state === 'error' || state === 'idle') {
             setTranscriptDraft('');
+          }
+          if (mic) {
+            setMicState(mic);
           }
           break;
         }
@@ -349,8 +333,6 @@ export default function App() {
   if (!setupDone) {
     return (
       <SetupScreen
-        initialMicDeviceId={micDeviceId}
-        onMicDeviceChange={setMicDeviceId}
         onComplete={() => {
           postToExtension({ type: 'SETUP_COMPLETE', payload: {} });
           setSetupDone(true);
@@ -423,10 +405,9 @@ export default function App() {
       )}
 
       <VoiceOrb
-        isListening={isListening}
-        onStart={() => void handleVoiceStart()}
-        onEnd={() => void handleVoiceEnd()}
-        analyserNode={analyserNode}
+        micState={micState}
+        onStart={handleVoiceStart}
+        onEnd={handleVoiceEnd}
       />
 
       <div className="tara-input-bar">
@@ -439,11 +420,13 @@ export default function App() {
             placeholder={
               pendingQuestion
                 ? 'Answer Tara…'
-                : isListening
+                : micState === 'capturing'
                   ? 'Listening…'
-                  : 'or type a command…'
+                  : micState === 'opening'
+                    ? 'Opening microphone…'
+                    : 'or type a command…'
             }
-            disabled={isListening}
+            disabled={micState !== 'idle'}
             autoComplete="off"
           />
           <button

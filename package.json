@@ -79,6 +79,13 @@
           "scope": "machine",
           "description": "Path to the claude CLI binary (defaults to 'claude' on PATH). Machine-scoped so a repository's .vscode/settings.json cannot point Tara at a different binary."
         },
+        "tara.ffmpegPath": {
+          "type": "string",
+          "default": "ffmpeg",
+          "scope": "machine",
+          "markdownDescription": "Path to the `ffmpeg` binary used for microphone capture (defaults to `ffmpeg` on PATH). Capture runs in the extension host because VS Code's webview iframes are created without `microphone` in their Permissions-Policy allow list, so `getUserMedia` cannot work there ([vscode#250568](https://github.com/microsoft/vscode/issues/250568)). Machine-scoped so a repository cannot point Tara at a different binary.",
+          "description": "Path to the ffmpeg binary used for microphone capture."
+        },
         "tara.model": {
           "type": "string",
           "default": "",

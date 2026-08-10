@@ -1,10 +1,16 @@
 import { useEffect, useRef, useState } from 'react';
 
+export type MicState = 'idle' | 'opening' | 'capturing';
+
 interface VoiceOrbProps {
-  isListening: boolean;
+  /**
+   * 'opening' is the ~450 ms a capture device takes to start delivering
+   * samples. It gets its own visual because the difference matters: speaking
+   * during it records nothing.
+   */
+  micState: MicState;
   onStart: () => void;
   onEnd: () => void;
-  analyserNode?: AnalyserNode | null;
 }
 
 const NUM_BARS = 32;
@@ -13,66 +19,41 @@ const BAR_MIN = 4;
 const BAR_MAX = 22;
 const CENTER = 80;        // SVG viewBox center
 
-export function VoiceOrb({ isListening, onStart, onEnd, analyserNode }: VoiceOrbProps) {
+export function VoiceOrb({ micState, onStart, onEnd }: VoiceOrbProps) {
   const [bars, setBars] = useState<number[]>(Array(NUM_BARS).fill(BAR_MIN));
   const animFrameRef = useRef<number>(0);
   const holdRef = useRef(false);
+  const isListening = micState === 'capturing';
 
-  // ── Audio-reactive bar animation ─────────────────────────────────────────
+  // ── Bar animation ─────────────────────────────────────────────────────────
+  // There is no AnalyserNode to drive this any more: the samples never enter
+  // this document, they go from ffmpeg straight to the Gemini socket in the
+  // extension host. So the bars are synthetic, and only their tempo carries
+  // meaning — lively for capturing, muted for opening, near-still for idle.
   useEffect(() => {
-    if (!isListening) {
-      // Idle breathing — subtle low-amplitude wave
-      let t = 0;
-      const idle = () => {
-        t += 0.04;
-        setBars(
-          Array.from({ length: NUM_BARS }, (_, i) => {
-            const wave = Math.sin(t + (i / NUM_BARS) * Math.PI * 2) * 0.5 + 0.5;
+    const speed = isListening ? 0.08 : micState === 'opening' ? 0.05 : 0.04;
+    const depth = isListening ? 1 : micState === 'opening' ? 0.35 : 0;
+    let t = 0;
+    const tick = () => {
+      t += speed;
+      setBars(
+        Array.from({ length: NUM_BARS }, (_, i) => {
+          const angle = (i / NUM_BARS) * Math.PI * 2;
+          if (depth === 0) {
+            const wave = Math.sin(t + angle) * 0.5 + 0.5;
             return BAR_MIN + wave * 3; // very subtle idle pulse
-          })
-        );
-        animFrameRef.current = requestAnimationFrame(idle);
-      };
-      animFrameRef.current = requestAnimationFrame(idle);
-      return () => cancelAnimationFrame(animFrameRef.current!);
-    }
-
-    if (analyserNode) {
-      // Real frequency data from mic
-      const data = new Uint8Array(analyserNode.frequencyBinCount);
-      const draw = () => {
-        analyserNode.getByteFrequencyData(data);
-        const step = Math.floor(data.length / NUM_BARS);
-        setBars(
-          Array.from({ length: NUM_BARS }, (_, i) => {
-            const value = data[i * step] / 255;
-            return BAR_MIN + value * (BAR_MAX - BAR_MIN);
-          })
-        );
-        animFrameRef.current = requestAnimationFrame(draw);
-      };
-      animFrameRef.current = requestAnimationFrame(draw);
-    } else {
-      // CSS fallback — fake energetic animation
-      let t = 0;
-      const fake = () => {
-        t += 0.08;
-        setBars(
-          Array.from({ length: NUM_BARS }, (_, i) => {
-            const angle = (i / NUM_BARS) * Math.PI * 2;
-            const v =
-              Math.abs(Math.sin(t * 1.3 + angle)) * 0.6 +
-              Math.abs(Math.sin(t * 2.1 + angle * 1.7)) * 0.4;
-            return BAR_MIN + v * (BAR_MAX - BAR_MIN);
-          })
-        );
-        animFrameRef.current = requestAnimationFrame(fake);
-      };
-      animFrameRef.current = requestAnimationFrame(fake);
-    }
-
+          }
+          const v =
+            Math.abs(Math.sin(t * 1.3 + angle)) * 0.6 +
+            Math.abs(Math.sin(t * 2.1 + angle * 1.7)) * 0.4;
+          return BAR_MIN + v * depth * (BAR_MAX - BAR_MIN);
+        })
+      );
+      animFrameRef.current = requestAnimationFrame(tick);
+    };
+    animFrameRef.current = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(animFrameRef.current!);
-  }, [isListening, analyserNode]);
+  }, [isListening, micState]);
 
   // ── Pointer handlers ──────────────────────────────────────────────────────
   function handlePointerDown(e: React.PointerEvent) {
@@ -121,9 +102,21 @@ export function VoiceOrb({ isListening, onStart, onEnd, analyserNode }: VoiceOrb
         onPointerUp={handlePointerUp}
         onPointerLeave={handlePointerUp}
         onContextMenu={(e) => e.preventDefault()}
-        title={isListening ? 'Release to send' : 'Hold to speak'}
-        aria-label={isListening ? 'Recording — release to send' : 'Hold to speak'}
-        aria-pressed={isListening}
+        title={
+          micState === 'capturing'
+            ? 'Release to send'
+            : micState === 'opening'
+              ? 'Opening the microphone — wait for "Listening" before speaking'
+              : 'Hold to speak'
+        }
+        aria-label={
+          micState === 'capturing'
+            ? 'Recording — release to send'
+            : micState === 'opening'
+              ? 'Opening the microphone'
+              : 'Hold to speak'
+        }
+        aria-pressed={micState !== 'idle'}
       >
         {/* Circular EQ bars */}
         <svg
@@ -197,7 +190,11 @@ export function VoiceOrb({ isListening, onStart, onEnd, analyserNode }: VoiceOrb
 
         {/* Label */}
         <span className="voice-orb-label">
-          {isListening ? 'Listening…' : 'Hold to speak'}
+          {micState === 'capturing'
+            ? 'Listening…'
+            : micState === 'opening'
+              ? 'Opening mic…'
+              : 'Hold to speak'}
         </span>
       </button>
     </div>

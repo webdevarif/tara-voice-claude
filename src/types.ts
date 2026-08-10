@@ -20,7 +20,6 @@ export type TaraMessageType =
   | 'WEBVIEW_READY'           // webview has subscribed and wants its initial state
   | 'VOICE_START'             // user pressed push-to-talk
   | 'VOICE_STOP'              // user released push-to-talk
-  | 'VOICE_AUDIO_CHUNK'       // base64-encoded 16 kHz 16-bit mono PCM chunk
   | 'SEND_COMMAND'            // text command submitted from chat input
   | 'REPLY_TO_AGENT'          // answer to a clarifying question from an agent
   | 'STOP_AGENT'              // user clicked stop
@@ -30,8 +29,8 @@ export type TaraMessageType =
   | 'CHECK_SETUP'             // webview requests setup status check
   | 'SAVE_API_KEY'            // webview sends gemini API key to save
   | 'OPEN_URL'                // webview asks extension to open a URL
-  | 'SET_MIC_DEVICE'          // webview tells extension which mic device to use
-  | 'OPEN_MIC_SETTINGS'       // webview asks extension to open VS Code mic settings
+  | 'SET_MIC_DEVICE'          // webview picks an ffmpeg capture device
+  | 'INSTALL_FFMPEG'          // webview asks for the ffmpeg install command in a terminal
   | 'SETUP_COMPLETE'          // webview reports setup finished; persist it
   // Extension → Webview
   | 'TRANSCRIPT_TOKEN'        // streaming STT token
@@ -46,7 +45,7 @@ export type TaraMessageType =
   | 'ERROR'                   // error message to display
   | 'INIT'                    // initial state on panel load
   | 'SETUP_STATUS'            // extension reports setup check results
-  | 'VOICE_STATE';            // mic/voice pipeline state for UI feedback
+  | 'VOICE_STATE';            // Gemini session state, and/or `mic` capture state
 
 export interface ChatEntry {
   id: string;

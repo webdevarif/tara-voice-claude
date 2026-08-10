@@ -8,6 +8,13 @@ import {
   buildLaunchSpec,
 } from '../execution/AgentOrchestrator';
 import { GeminiVoiceBridge, VoiceState } from '../voice/GeminiVoiceBridge';
+import {
+  AudioInputDevice,
+  MicRecorder,
+  ffmpegInstallCommand,
+  listInputDevices,
+  probeFfmpeg,
+} from '../voice/MicRecorder';
 import { AgentStatus, ChatEntry, TaraMessage, isRiskyCommand } from '../types';
 
 /** SecretStorage key. Superseded the `tara.geminiApiKey` setting, which leaked via settings sync. */
@@ -24,6 +31,17 @@ interface SetupStatus {
   claudeVersion?: string;
   claudeAuthed: boolean;
   claudeAuthDetail?: string;
+  /**
+   * Capture runs through ffmpeg in this process because VS Code's webview
+   * iframes are built without `microphone` in their Permissions-Policy allow
+   * list — see the header of MicRecorder.ts.
+   */
+  ffmpegInstalled: boolean;
+  ffmpegVersion?: string;
+  ffmpegError?: string;
+  ffmpegInstallCommand: string;
+  micDevices: AudioInputDevice[];
+  micDeviceId: string;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -41,11 +59,33 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
    * session listening forever and never finalizing the utterance.
    */
   private voiceStopPending = false;
+  /** Microphone capture, in this process rather than the webview. */
+  private readonly recorder = new MicRecorder();
+  /** Cached from the last setup check so a press does not re-probe. */
+  private micDevices: AudioInputDevice[] = [];
+  private bytesThisUtterance = 0;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
     private readonly orchestrator: AgentOrchestrator
   ) {
+    // ffmpeg's stdout is already 16 kHz s16le mono — the exact wire format —
+    // so this is a base64 wrap and nothing more.
+    this.recorder.on('data', (chunk: Buffer) => {
+      this.bytesThisUtterance += chunk.length;
+      this.voiceBridge?.sendAudioChunk(chunk.toString('base64'));
+    });
+    // Opening a dshow graph takes ~450 ms, so "listening" is only true once the
+    // first sample actually lands. Claiming it earlier trains users to start
+    // talking into a device that is not open yet.
+    this.recorder.on('capturing', () => {
+      this.postMessage({ type: 'VOICE_STATE', payload: { mic: 'capturing' } });
+    });
+    this.recorder.on('error', (message: string) => {
+      this.postMessage({ type: 'VOICE_STATE', payload: { mic: 'idle' } });
+      this.postMessage({ type: 'ERROR', payload: { message } });
+    });
+
     // Wired once, in the constructor. Doing this in resolveWebviewView would add
     // a duplicate listener every time the view is recreated.
     this.orchestrator.onOutput((agentId, data) => this.handleAgentOutput(agentId, data));
@@ -282,6 +322,99 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  // ── Capture ────────────────────────────────────────────────────────────────
+
+  private ffmpegPath(): string {
+    return vscode.workspace.getConfiguration('tara').get<string>('ffmpegPath') || 'ffmpeg';
+  }
+
+  /**
+   * The stored id, if that device is still present. dshow ids are stable per
+   * endpoint, but unplugging a USB mic retires one — falling back beats failing.
+   */
+  private async resolveMicDevice(): Promise<string | undefined> {
+    const stored = this.context.globalState.get<string>(STATE_MIC_DEVICE, '');
+    if (!this.micDevices.length) {
+      this.micDevices = await listInputDevices(this.ffmpegPath());
+    }
+    if (stored && this.micDevices.some((d) => d.id === stored)) {
+      return stored;
+    }
+    return this.micDevices[0]?.id;
+  }
+
+  private async startCapture() {
+    this.voiceStopPending = false;
+    this.bytesThisUtterance = 0;
+    this.postMessage({ type: 'VOICE_STATE', payload: { mic: 'opening' } });
+
+    const deviceId = await this.resolveMicDevice();
+    if (!deviceId) {
+      this.postMessage({ type: 'VOICE_STATE', payload: { mic: 'idle' } });
+      this.postMessage({
+        type: 'ERROR',
+        payload: {
+          message: this.micDevices.length
+            ? 'No microphone selected.'
+            : 'No microphone was found. Check that ffmpeg is installed and a capture device is connected.',
+        },
+      });
+      return;
+    }
+
+    const bridge = await this.getOrCreateVoiceBridge();
+    if (!bridge) {
+      this.postMessage({ type: 'VOICE_STATE', payload: { mic: 'idle' } });
+      return;
+    }
+
+    // Arming the turn and opening the device are independent, and the device is
+    // the slow one (~450 ms). Serialising them would add the socket round-trip
+    // on top of that for no reason; chunks that beat the socket open are
+    // buffered by the bridge.
+    try {
+      await Promise.all([bridge.startListening(), this.recorder.start(this.ffmpegPath(), deviceId)]);
+    } catch (err) {
+      this.postMessage({ type: 'VOICE_STATE', payload: { mic: 'idle' } });
+      this.postMessage({
+        type: 'ERROR',
+        payload: {
+          message: err instanceof Error ? err.message : 'Could not start the microphone.',
+        },
+      });
+      await this.recorder.stop();
+      return;
+    }
+
+    // The release can land while the device is still opening.
+    if (this.voiceStopPending) {
+      this.voiceStopPending = false;
+      await this.stopCapture();
+    }
+  }
+
+  private async stopCapture() {
+    if (!this.recorder.active && !this.voiceBridge) {
+      // Nothing is running yet — remember the release so startCapture honours it.
+      this.voiceStopPending = true;
+      return;
+    }
+
+    // Stop the device first and wait for it to exit, so `audioStreamEnd` cannot
+    // race ahead of the last chunks and truncate the utterance server-side.
+    await this.recorder.stop();
+    this.postMessage({ type: 'VOICE_STATE', payload: { mic: 'idle' } });
+    this.voiceBridge?.stopListening();
+
+    if (this.bytesThisUtterance === 0) {
+      // Under ~450 ms of hold, the device never opened. Say why rather than
+      // letting the user wonder where their words went.
+      this.addSystemMessage(
+        'No audio was captured — the microphone takes about half a second to open. Hold the button until the indicator says "listening", then speak.'
+      );
+    }
+  }
+
   // ── Message handling ───────────────────────────────────────────────────────
 
   private async handleWebviewMessage(msg: TaraMessage) {
@@ -298,34 +431,12 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
           this.addSystemMessage('Voice input is disabled — set "tara.voiceMode" to enable it.');
           break;
         }
-        this.voiceStopPending = false;
-        const bridge = await this.getOrCreateVoiceBridge();
-        if (!bridge) {
-          break;
-        }
-        await bridge.startListening();
-        // The release may have happened while we were connecting.
-        if (this.voiceStopPending) {
-          this.voiceStopPending = false;
-          bridge.stopListening();
-        }
+        await this.startCapture();
         break;
       }
 
       case 'VOICE_STOP': {
-        if (this.voiceBridge) {
-          this.voiceBridge.stopListening();
-        } else {
-          this.voiceStopPending = true;
-        }
-        break;
-      }
-
-      case 'VOICE_AUDIO_CHUNK': {
-        const { base64 } = msg.payload as { base64?: string };
-        if (base64) {
-          this.voiceBridge?.sendAudioChunk(base64);
-        }
+        await this.stopCapture();
         break;
       }
 
@@ -394,8 +505,12 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         break;
       }
 
-      case 'OPEN_MIC_SETTINGS': {
-        void vscode.commands.executeCommand('workbench.action.openSettings', 'microphone');
+      case 'INSTALL_FFMPEG': {
+        // Typed into a terminal but deliberately not executed: this installs
+        // software, so the user gets to read it and press Enter themselves.
+        const terminal = vscode.window.createTerminal('Tara — install ffmpeg');
+        terminal.show();
+        terminal.sendText(ffmpegInstallCommand(), false);
         break;
       }
 
@@ -491,7 +606,28 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       geminiKey,
       claudeInstalled: false,
       claudeAuthed: false,
+      ffmpegInstalled: false,
+      ffmpegInstallCommand: ffmpegInstallCommand(),
+      micDevices: [],
+      micDeviceId: '',
     };
+
+    // ffmpeg is what reaches the microphone; enumerate devices only if it runs.
+    const ffmpeg = await probeFfmpeg(this.ffmpegPath());
+    status.ffmpegInstalled = ffmpeg.ok;
+    status.ffmpegVersion = ffmpeg.version;
+    status.ffmpegError = ffmpeg.error;
+    if (ffmpeg.ok) {
+      this.micDevices = await listInputDevices(this.ffmpegPath());
+      status.micDevices = this.micDevices;
+      const resolved = await this.resolveMicDevice();
+      status.micDeviceId = resolved ?? '';
+      // Persist the fallback so the picker and the next capture agree.
+      const stored = this.context.globalState.get<string>(STATE_MIC_DEVICE, '');
+      if (resolved && resolved !== stored) {
+        await this.context.globalState.update(STATE_MIC_DEVICE, resolved);
+      }
+    }
 
     const version = await runClaude(claudePath, ['--version']);
     if (!version.ok) {
@@ -590,6 +726,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
 
   dispose() {
     this.disposeViewListeners();
+    // Before the bridge, so no chunk is emitted at a disposed listener — and so
+    // the microphone is released even if the bridge teardown throws.
+    this.recorder.dispose();
     this.voiceBridge?.dispose();
     this.voiceBridge = undefined;
   }
@@ -602,12 +741,6 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       vscode.Uri.joinPath(distPath, 'assets', 'index.js')
     );
     const cssUri = findCssUri(webview, distPath);
-    // Shipped un-hashed from `public/`, so this URI is stable. AudioWorklet
-    // module loads are checked against script-src, which allows cspSource; a
-    // nonce cannot authorize them because the fetch has no element.
-    const workletUri = webview.asWebviewUri(
-      vscode.Uri.joinPath(distPath, 'pcm16k-worklet.js')
-    );
     const nonce = getNonce();
 
     return /* html */ `<!DOCTYPE html>
@@ -629,7 +762,6 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
 </head>
 <body>
   <div id="root"></div>
-  <script nonce="${nonce}">window.__taraWorkletUri = ${JSON.stringify(workletUri.toString())};</script>
   <script type="module" nonce="${nonce}" src="${scriptUri}"></script>
 </body>
 </html>`;
