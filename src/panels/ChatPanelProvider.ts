@@ -22,7 +22,7 @@ import {
   probeCapture,
 } from '../voice/MicRecorder';
 import { verifyGeminiKey } from '../voice/GeminiKeyCheck';
-import { Vad } from '../voice/Vad';
+import { Vad, chunkRms } from '../voice/Vad';
 import { ConversationStore } from '../history/ConversationStore';
 import {
   AudioOutputDevice,
@@ -497,6 +497,16 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       this.flushTaraSpeech();
       this.postMessage({ type: 'TTS_DONE', payload: {} });
     });
+    bridge.on('languageCodeDropped', (why: string) => {
+      // Worth saying rather than swallowing: the language still applies, but
+      // through the prompt alone, and that is a weaker guarantee than the field.
+      // Someone debugging "it answered in English again" needs to know which of
+      // the two mechanisms is actually in play.
+      this.addSystemMessage(
+        `This model would not take a language code (${why}), so the language is ` +
+          'set by instruction only. Voice is working.'
+      );
+    });
     bridge.on('error', (message: string) => {
       this.postMessage({ type: 'ERROR', payload: { message } });
     });
@@ -656,10 +666,58 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
    */
   private static readonly ECHO_TAIL_MS = 400;
 
+  /**
+   * Learned loudness of our own audio as the microphone hears it.
+   *
+   * Measured rather than configured, because the right number depends on speaker
+   * volume, microphone gain and the room — three things no default can know. The
+   * first few chunks of every reply teach it; after that anything much louder is
+   * someone talking over her.
+   */
+  private echoLevel = 0;
+  private echoChunks = 0;
+  private bargeRun = 0;
+
+  /** How much louder than our own echo counts as the user interrupting. */
+  private static readonly BARGE_RATIO = 2.5;
+  /** Absolute floor, so a very quiet reply cannot make ordinary room noise a barge-in. */
+  private static readonly BARGE_MIN_LEVEL = 1200;
+  /** Chunks spent learning the echo level before barge-in is armed. */
+  private static readonly BARGE_LEARN_CHUNKS = 8;
+  /** Consecutive loud chunks required, so one door slam is not an interruption. */
+  private static readonly BARGE_CONFIRM_CHUNKS = 2;
+
   private holdOutput(bytes: number) {
+    if (!this.outputBusy) {
+      // A fresh utterance. The level learned from the last one was measured at
+      // whatever the volume was then, and the gap may have been long enough for
+      // the user to have changed it.
+      this.echoLevel = 0;
+      this.echoChunks = 0;
+      this.bargeRun = 0;
+    }
     const ms = (bytes / (OUTPUT_BYTES_PER_SECOND / 1000)) | 0;
     const from = Math.max(Date.now(), this.outputBusyUntil);
     this.outputBusyUntil = from + ms;
+  }
+
+  /**
+   * The user talked over a reply.
+   *
+   * Playback stops here rather than when the model's own turn ends, because the
+   * audio already queued would otherwise keep talking over someone who has
+   * plainly stopped listening. The model is not told explicitly — capture resumes
+   * immediately, and its own server-side VAD raises `interrupted` from the audio
+   * it then receives.
+   */
+  private bargeIn() {
+    this.speaker.reset();
+    this.outputBusyUntil = 0;
+    this.echoLevel = 0;
+    this.echoChunks = 0;
+    this.bargeRun = 0;
+    this.vad.reset();
+    this.postMessage({ type: 'TTS_DONE', payload: {} });
   }
 
   private get outputBusy(): boolean {
@@ -820,6 +878,12 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       this.vad.reset();
       this.preroll = [];
       this.prerollBytes = 0;
+      // Switching the microphone off is the clearest possible statement that
+      // nothing is coming, and the connection is what costs money. Kept open only
+      // while an agent still owes this session a tool response.
+      if (this.toolCallByAgent.size === 0) {
+        this.voiceBridge?.disconnect();
+      }
       this.postMicState();
       return;
     }
@@ -879,6 +943,33 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       }
       this.preroll = [];
       this.prerollBytes = 0;
+
+      // Her voice must not reach the gate, or she opens a turn on herself. But the
+      // room is still measured, because the user talking over her is the one thing
+      // that has to get through a closed gate.
+      const level = chunkRms(chunk);
+      this.echoChunks += 1;
+      if (this.echoChunks <= ChatPanelProvider.BARGE_LEARN_CHUNKS) {
+        // Nothing to compare against yet — and there is nothing worth
+        // interrupting in the first fraction of a second of a reply anyway.
+        this.echoLevel = Math.max(this.echoLevel, level);
+        return;
+      }
+      const threshold = Math.max(
+        this.echoLevel * ChatPanelProvider.BARGE_RATIO,
+        ChatPanelProvider.BARGE_MIN_LEVEL
+      );
+      if (level <= threshold) {
+        this.bargeRun = 0;
+        // Follow the echo down as the voice trails off, so the bar to interrupt
+        // falls with it rather than staying at the loudest syllable's height.
+        this.echoLevel = this.echoLevel * 0.9 + level * 0.1;
+        return;
+      }
+      this.bargeRun += 1;
+      if (this.bargeRun >= ChatPanelProvider.BARGE_CONFIRM_CHUNKS) {
+        this.bargeIn();
+      }
       return;
     }
     if (this.streaming) {
@@ -969,6 +1060,16 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       }
       this.awake = false;
       this.postMicState();
+      // Live is billed per minute of *connection*, not per second of audio sent,
+      // so gating the audio while holding the socket open still runs the meter
+      // for a room nobody is talking in. The socket closes here and reopens on
+      // the next burst of sound — startListening() connects first for exactly
+      // this reason, and the preroll buffer covers the handshake, so nothing the
+      // user says is lost to it. A pending tool call is the one exception: its id
+      // only means something to this session.
+      if (this.toolCallByAgent.size === 0) {
+        this.voiceBridge?.disconnect();
+      }
       this.addSystemMessage('Gone quiet after 15s — say "wake up" to start again.');
     }, ChatPanelProvider.SLEEP_AFTER_MS);
   }

@@ -144,3 +144,25 @@ function rms(buf: Buffer, offset: number): number {
   }
   return Math.sqrt(sum / FRAME_SAMPLES);
 }
+
+/**
+ * Loudness of a whole chunk, on the same 0–32767 scale.
+ *
+ * Separate from the gate above because it is used while the gate is deliberately
+ * switched off: when Tara is speaking, her own voice must not reach the VAD, but
+ * something still has to measure the room in order to notice the user talking
+ * over her. An odd trailing byte is ignored rather than carried — one sample in
+ * a chunk of hundreds cannot change a mean square.
+ */
+export function chunkRms(chunk: Buffer): number {
+  const samples = Math.floor(chunk.length / 2);
+  if (samples === 0) {
+    return 0;
+  }
+  let sum = 0;
+  for (let i = 0; i < samples; i++) {
+    const s = chunk.readInt16LE(i * 2);
+    sum += s * s;
+  }
+  return Math.sqrt(sum / samples);
+}

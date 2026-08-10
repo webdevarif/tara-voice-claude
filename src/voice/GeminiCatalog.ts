@@ -151,13 +151,21 @@ export function buildSystemInstruction(language: string): string {
   const name = code === 'auto' ? '' : languageLabel(code);
 
   const languageRule = name
-    ? `The user speaks ${name}. Understand them as ${name} — never as some other ` +
-      `language that sounds similar — and always reply in ${name}, however strong ` +
+    ? `This user's language is ${name}. Understand them as ${name} — never as some ` +
+      `other language that sounds similar — and reply in ${name}, however strong ` +
       `their accent is and whatever language these instructions are written in. ` +
-      `Switch only if they explicitly ask you to.`
+      `That includes errors and refusals. If they ask you outright to use a ` +
+      `different language, do it from that message onward; a request made once is ` +
+      `enough and does not have to be repeated.\n` +
+      // Without this the rule gets read as being about substance: a request in
+      // Bengali came back as a *different answer* rather than the same answer in
+      // Bengali. It is a rule about wording only.
+      `This line describes the language, not the content: it never means a request ` +
+      `should be answered differently, only written differently.`
     : 'Reply in whichever language the user speaks to you in, and switch when ' +
       'they switch. Never answer in a different language from the one you were ' +
-      'just addressed in.';
+      'just addressed in. This is about wording, not substance — the language ' +
+      'someone asks in never changes what the right answer is.';
 
   return [
     'You are Tara, a voice assistant built into VS Code. You are talking with a',

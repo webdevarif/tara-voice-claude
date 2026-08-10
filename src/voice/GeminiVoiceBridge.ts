@@ -150,6 +150,13 @@ export class GeminiVoiceBridge extends EventEmitter {
    */
   private epoch = 0;
   /**
+   * Set once a handshake has been refused while a `languageCode` was in the
+   * frame. Sticky for the life of the bridge: having learned this model will not
+   * take one, there is no reason to spend another failed handshake finding out
+   * again on every reconnect.
+   */
+  private dropLanguageCode = false;
+  /**
    * Whether a turn is open and audio is being streamed. Tracked separately from
    * `state`, because server frames also drive `state` — gating the release on
    * `state === 'listening'` meant a frame arriving mid-utterance could swallow
@@ -295,6 +302,21 @@ export class GeminiVoiceBridge extends EventEmitter {
         }
         if (!wasReady) {
           const detail = reason?.toString?.() || '';
+          // Refused while we were naming a language: the language is the first
+          // suspect, because everything else in this frame was accepted on the
+          // previous connection. Retry once without it, settling the *same*
+          // promise, so the caller sees one slower connect rather than an error
+          // it could not have acted on. The system instruction still carries the
+          // language, so this degrades rather than loses the setting.
+          if (!this.disposed && !this.dropLanguageCode && this.usingLanguageCode()) {
+            this.dropLanguageCode = true;
+            this.emit(
+              'languageCodeDropped',
+              detail || `setup refused with code ${code}`
+            );
+            this.openSocket().then(settleOk, settleErr);
+            return;
+          }
           settleErr(
             new Error(
               `Gemini Live closed before setup (code ${code}${detail ? `: ${detail}` : ''}). ` +
@@ -329,17 +351,7 @@ export class GeminiVoiceBridge extends EventEmitter {
           // Exactly one modality is allowed. Text comes from the two
           // transcription configs below, which are not modalities.
           responseModalities: ['AUDIO'],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName: this.voiceName },
-            },
-            // Deliberately no `languageCode`. The Live guide states that native
-            // audio output models "automatically choose the appropriate language
-            // and don't support explicitly setting the language code", so
-            // sending one risks failing setup on exactly the models this design
-            // depends on. Language is steered from the system instruction, which
-            // every family honours.
-          },
+          speechConfig: this.buildSpeechConfig(),
         },
         tools: [TOOL_DECLARATION],
         // Siblings of generationConfig, not children of it. Empty object is the
@@ -351,6 +363,40 @@ export class GeminiVoiceBridge extends EventEmitter {
         },
       },
     };
+  }
+
+  /**
+   * `speechConfig`, with a `languageCode` unless we have learned it is refused.
+   *
+   * The Live guide says native-audio models "don't support explicitly setting the
+   * language code", and on that basis this field was left out. A working
+   * implementation against `gemini-3.1-flash-live-preview` sends it and is
+   * answered, so the field goes in: a shipped session beats a doc sentence.
+   *
+   * But not blindly. If setup is refused while we are sending one, `dropLanguageCode`
+   * is set and the reconnect goes without it — so a model that really does reject
+   * it costs one handshake instead of breaking voice entirely. The system
+   * instruction carries the language either way, which is what makes that
+   * fallback survivable rather than a silent loss of the setting.
+   */
+  /** Whether this session names a language in the frame, as opposed to only in the prompt. */
+  private usingLanguageCode(): boolean {
+    return !!this.language && this.language !== 'auto';
+  }
+
+  private buildSpeechConfig(): Record<string, unknown> {
+    const config: Record<string, unknown> = {
+      voiceConfig: {
+        prebuiltVoiceConfig: { voiceName: this.voiceName },
+      },
+    };
+    // 'auto' is this picker's word for "you decide", not a BCP-47 tag. The API
+    // expresses that by the field being absent; forwarded verbatim it would be a
+    // code no locale matches, which is a stricter instruction than none.
+    if (this.usingLanguageCode() && !this.dropLanguageCode) {
+      config.languageCode = this.language;
+    }
+    return config;
   }
 
   private scheduleReconnect() {
