@@ -15,18 +15,31 @@ import {
   listInputDevices,
   probeFfmpeg,
 } from '../voice/MicRecorder';
+import { verifyGeminiKey } from '../voice/GeminiKeyCheck';
 import { AgentStatus, ChatEntry, TaraMessage, isRiskyCommand } from '../types';
 
 /** SecretStorage key. Superseded the `tara.geminiApiKey` setting, which leaked via settings sync. */
 const SECRET_GEMINI_KEY = 'tara.geminiApiKey';
 const STATE_SETUP_COMPLETE = 'tara.setupComplete';
 const STATE_MIC_DEVICE = 'tara.micDeviceId';
+/**
+ * Whether the key currently in SecretStorage has been proven to work. Only
+ * `setApiKey` writes the key, so this cannot drift away from it. A key that
+ * predates verification — or one migrated out of the old plaintext setting —
+ * arrives with this false and is checked once on the next setup check.
+ */
+const STATE_KEY_VERIFIED = 'tara.geminiKeyVerified';
 
 /** Keeps the retained webview from growing without bound over a long session. */
 const MAX_HISTORY_ENTRIES = 400;
 
 interface SetupStatus {
+  /** True only for a key that is stored *and* verified against the API. */
   geminiKey: boolean;
+  /** Why the last key was refused, if it was. */
+  apiKeyError?: string;
+  /** Key works, but the configured Live model looks wrong. Not a blocker. */
+  apiKeyModelWarning?: string;
   claudeInstalled: boolean;
   claudeVersion?: string;
   claudeAuthed: boolean;
@@ -64,6 +77,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   /** Cached from the last setup check so a press does not re-probe. */
   private micDevices: AudioInputDevice[] = [];
   private bytesThisUtterance = 0;
+  /** Carried into the next SETUP_STATUS so the setup screen can explain itself. */
+  private apiKeyError = '';
+  private apiKeyModelWarning = '';
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -214,13 +230,63 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     return legacy;
   }
 
-  private async setApiKey(key: string) {
+  /**
+   * The only writer of the key, so it is also the only writer of the verified
+   * flag — the two cannot drift apart.
+   */
+  private async setApiKey(key: string, verified: boolean) {
     const trimmed = key.trim();
     if (trimmed) {
       await this.context.secrets.store(SECRET_GEMINI_KEY, trimmed);
     } else {
       await this.context.secrets.delete(SECRET_GEMINI_KEY);
     }
+    await this.context.globalState.update(STATE_KEY_VERIFIED, trimmed ? verified : false);
+  }
+
+  private liveModel(): string {
+    return (
+      vscode.workspace.getConfiguration('tara').get<string>('geminiLiveModel') ?? ''
+    );
+  }
+
+  /**
+   * Checks a candidate key and stores it only if the API accepts it. A key that
+   * cannot be reached for verification is not stored either — otherwise "saved"
+   * would mean nothing more than "typed".
+   */
+  private async saveApiKeyIfValid(candidate: string) {
+    const trimmed = candidate.trim();
+    if (!trimmed) {
+      // An empty box means "forget my key"; there is nothing to verify.
+      await this.setApiKey('', false);
+      this.apiKeyError = '';
+      this.apiKeyModelWarning = '';
+      this.voiceBridge?.dispose();
+      this.voiceBridge = undefined;
+      await this.runSetupCheck();
+      return;
+    }
+
+    const result = await verifyGeminiKey(trimmed, this.liveModel());
+    if (!result.ok) {
+      this.apiKeyError = result.reachable
+        ? (result.message ?? 'That key was rejected.')
+        : `${result.message ?? 'Could not verify the key.'} The key was not saved.`;
+      this.apiKeyModelWarning = '';
+      // Deliberately no store: an unverified key must not linger and then fail
+      // later, mid-utterance, as an opaque WebSocket close.
+      await this.runSetupCheck();
+      return;
+    }
+
+    this.apiKeyError = '';
+    this.apiKeyModelWarning = result.modelWarning ?? '';
+    await this.setApiKey(trimmed, true);
+    // A new key makes any open session stale.
+    this.voiceBridge?.dispose();
+    this.voiceBridge = undefined;
+    await this.runSetupCheck();
   }
 
   // ── Voice ──────────────────────────────────────────────────────────────────
@@ -475,11 +541,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
 
       case 'SAVE_API_KEY': {
         const { key } = msg.payload as { key: string };
-        await this.setApiKey(key);
-        // A new key means the old connection is stale.
-        this.voiceBridge?.dispose();
-        this.voiceBridge = undefined;
-        await this.runSetupCheck();
+        await this.saveApiKeyIfValid(key);
         break;
       }
 
@@ -599,11 +661,43 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
 
   private async runSetupCheck() {
     const config = vscode.workspace.getConfiguration('tara');
-    const geminiKey = !!(await this.getApiKey());
+    const storedKey = await this.getApiKey();
     const claudePath = config.get<string>('claudeCodePath') || 'claude';
+
+    // A key is only "set up" once it has been proven to work. Keys written by
+    // an earlier build, or migrated out of the plaintext setting, arrive
+    // unverified — check those once here rather than trusting them.
+    let geminiKey = false;
+    if (storedKey) {
+      if (this.context.globalState.get<boolean>(STATE_KEY_VERIFIED, false)) {
+        geminiKey = true;
+      } else {
+        const result = await verifyGeminiKey(storedKey, this.liveModel());
+        if (result.ok) {
+          geminiKey = true;
+          await this.context.globalState.update(STATE_KEY_VERIFIED, true);
+          this.apiKeyModelWarning = result.modelWarning ?? '';
+        } else if (result.reachable) {
+          // The service answered and refused it, so the stored key is no good.
+          // It stays in storage — deleting what the user pasted, unasked, would
+          // be worse than telling them it does not work.
+          this.apiKeyError = result.message ?? 'The stored key is no longer valid.';
+        } else {
+          // Offline. There is no evidence against this key, and blocking the
+          // gate here would also block text commands, which never touch Gemini.
+          // So accept it provisionally and re-check when the network is back;
+          // the verified flag stays false, so this is not a permanent pass.
+          geminiKey = true;
+          this.apiKeyModelWarning =
+            result.message ?? 'Could not reach Google to re-check the stored key.';
+        }
+      }
+    }
 
     const status: SetupStatus = {
       geminiKey,
+      apiKeyError: this.apiKeyError || undefined,
+      apiKeyModelWarning: this.apiKeyModelWarning || undefined,
       claudeInstalled: false,
       claudeAuthed: false,
       ffmpegInstalled: false,

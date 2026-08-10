@@ -9,6 +9,8 @@ interface AudioInputDevice {
 
 interface SetupStatus {
   geminiKey: boolean;
+  apiKeyError?: string;
+  apiKeyModelWarning?: string;
   claudeInstalled: boolean;
   claudeVersion?: string;
   claudeAuthed?: boolean;
@@ -30,6 +32,9 @@ type ItemStatus = 'pending' | 'ok' | 'error' | 'checking';
 export function SetupScreen({ onComplete }: SetupScreenProps) {
   const [apiKey, setApiKey] = useState('');
   const [apiKeyStatus, setApiKeyStatus] = useState<ItemStatus>('pending');
+  /** Why the host refused the last key. Empty when there is nothing to explain. */
+  const [apiKeyError, setApiKeyError] = useState('');
+  const [apiKeyModelWarning, setApiKeyModelWarning] = useState('');
 
   // The microphone check is now "can the extension host reach a capture
   // device", not "will this document be granted getUserMedia" — the latter is
@@ -56,7 +61,15 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
         return;
       }
       const payload = msg.payload as SetupStatus;
-      setApiKeyStatus(payload.geminiKey ? 'ok' : 'pending');
+      setApiKeyStatus(
+        payload.geminiKey ? 'ok' : payload.apiKeyError ? 'error' : 'pending'
+      );
+      setApiKeyError(payload.geminiKey ? '' : (payload.apiKeyError ?? ''));
+      setApiKeyModelWarning(payload.apiKeyModelWarning ?? '');
+      if (payload.geminiKey) {
+        // Accepted and stored — now it is safe to drop the plaintext copy.
+        setApiKey('');
+      }
       setClaudeStatus(payload.claudeInstalled ? 'ok' : 'error');
       setClaudeVersion(payload.claudeVersion ?? '');
       setClaudeAuthed(!!payload.claudeAuthed);
@@ -78,7 +91,10 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
       return;
     }
     postToExtension({ type: 'SAVE_API_KEY', payload: { key: apiKey.trim() } });
-    setApiKey('');
+    // The key stays in the box until the host confirms it — clearing it here
+    // would lose a good key to a dropped connection and make the user re-paste
+    // it, unable to tell a rejection from a network blip.
+    setApiKeyError('');
     setApiKeyStatus('checking');
   }
 
@@ -108,8 +124,12 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
       <p className="setup-sub">Complete setup to start talking to your codebase.</p>
 
       <div className="setup-cards">
-        {/* 1 — Gemini API key */}
-        <div className={`setup-card ${apiKeyStatus === 'ok' ? 'card-ok' : ''}`}>
+        {/* 1 — Gemini API key. Verified against the API before it is stored. */}
+        <div
+          className={`setup-card ${
+            apiKeyStatus === 'ok' ? 'card-ok' : apiKeyStatus === 'error' ? 'card-error' : ''
+          }`}
+        >
           <div className="setup-card-header">
             <span className="setup-card-icon">🔑</span>
             <div className="setup-card-title-wrap">
@@ -122,9 +142,14 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
           </div>
 
           {apiKeyStatus === 'ok' ? (
-            <p className="setup-card-ok-msg">
-              ✓ Stored in VS Code&apos;s encrypted secret storage
-            </p>
+            <>
+              <p className="setup-card-ok-msg">
+                ✓ Verified with Google, stored in VS Code&apos;s encrypted secret storage
+              </p>
+              {apiKeyModelWarning && (
+                <p className="setup-card-hint">⚠ {apiKeyModelWarning}</p>
+              )}
+            </>
           ) : (
             <>
               <div className="setup-card-action">
@@ -135,18 +160,22 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
                   placeholder="AIza…"
                   value={apiKey}
                   onChange={(e) => setApiKey(e.target.value)}
-                  onKeyDown={(e) => e.key === 'Enter' && handleSaveKey()}
+                  onKeyDown={(e) =>
+                    e.key === 'Enter' && apiKeyStatus !== 'checking' && handleSaveKey()
+                  }
                   autoComplete="off"
+                  disabled={apiKeyStatus === 'checking'}
                 />
                 <button
                   id="setup-save-key-btn"
                   className="setup-btn setup-btn-primary"
                   onClick={handleSaveKey}
-                  disabled={!apiKey.trim()}
+                  disabled={!apiKey.trim() || apiKeyStatus === 'checking'}
                 >
-                  Save
+                  {apiKeyStatus === 'checking' ? 'Verifying…' : 'Verify & Save'}
                 </button>
               </div>
+              {apiKeyError && <p className="setup-card-error-msg">✕ {apiKeyError}</p>}
               <a
                 className="setup-link"
                 onClick={() =>
