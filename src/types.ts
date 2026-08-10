@@ -38,10 +38,20 @@ export type TaraMessageType =
   | 'SET_VOICE'               // webview picks a prebuilt Gemini voice
   | 'SET_LIVE_MODEL'          // webview picks the Gemini Live model
   | 'SET_LANGUAGE'            // webview picks the spoken language, or auto-detect
+  | 'SAVE_PICOVOICE_KEY'      // AccessKey for the speaker gate
+  | 'ENROLL_FROM_FILE'        // pick an audio file and learn the owner's voice from it
+  | 'ENROLL_START'            // begin learning the owner's voice from the microphone
+  | 'ENROLL_STOP'             // finish enrolment with whatever has been heard
+  | 'ENROLL_CANCEL'           // abandon enrolment, keeping any previous profile
+  | 'DELETE_VOICE_PROFILE'    // forget the enrolled voice; answer everyone again
   | 'SET_SPEAK_RESPONSES'     // webview toggles whether Tara talks back
   | 'INSTALL_FFMPEG'          // webview asks for the ffmpeg install command in a terminal
   | 'SETUP_COMPLETE'          // webview reports setup finished; persist it
   // Extension → Webview
+  | 'ENROLL_PROGRESS'         // how much of a voice profile has been gathered
+  | 'ENROLL_DONE'             // enrolment finished, saved or not, with the reason
+  | 'ENROLL_PROGRESS'         // how much of a voice profile has been gathered
+  | 'ENROLL_DONE'             // enrolment finished, saved or not, with the reason
   | 'SESSIONS'                // this project's conversations, newest first
   | 'USER_MESSAGE'            // a user entry the host recorded (typed or dictated)
   | 'TRANSCRIPT_TOKEN'        // streaming STT token

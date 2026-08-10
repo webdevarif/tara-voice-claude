@@ -36,6 +36,18 @@ interface SetupStatus {
   language?: string;
   languageOptions?: LanguageOption[];
   speakResponses?: boolean;
+  speakerGate?: SpeakerGateProbe;
+  /** Whether a Picovoice AccessKey is stored. Never the key itself. */
+  picovoiceKey?: boolean;
+}
+
+interface SpeakerGateProbe {
+  moduleOk: boolean;
+  moduleError?: string;
+  hasProfile: boolean;
+  /** Epoch ms. */
+  enrolledAt?: number;
+  enrolledSeconds?: number;
 }
 
 interface LanguageOption {
@@ -98,6 +110,15 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
   const [languageOptions, setLanguageOptions] = useState<LanguageOption[]>([]);
   const [speakResponses, setSpeakResponses] = useState(true);
 
+  // ── Only my voice ─────────────────────────────────────────────────────────
+  const [gate, setGate] = useState<SpeakerGateProbe>({ moduleOk: false, hasProfile: false });
+  const [pvKeyStored, setPvKeyStored] = useState(false);
+  const [pvKeyInput, setPvKeyInput] = useState('');
+  /** Non-null only while an enrolment is in progress. */
+  const [enrollPercent, setEnrollPercent] = useState<number | null>(null);
+  const [enrollNote, setEnrollNote] = useState('');
+  const [enrollResult, setEnrollResult] = useState<{ ok: boolean; message: string } | null>(null);
+
   const [claudeStatus, setClaudeStatus] = useState<ItemStatus>('checking');
   const [claudeVersion, setClaudeVersion] = useState('');
   const [claudeAuthed, setClaudeAuthed] = useState(false);
@@ -109,10 +130,34 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
   // ── Setup status from the extension host ──────────────────────────────────
   useEffect(() => {
     const cleanup = onExtensionMessage((msg) => {
+      if (msg.type === 'ENROLL_PROGRESS') {
+        const { percent, note } = msg.payload as { percent: number; note?: string };
+        setEnrollPercent(percent);
+        // Kept when this frame carries none, so a per-chunk progress update does
+        // not blank the instruction the user is following.
+        if (note) {
+          setEnrollNote(note);
+        }
+        setEnrollResult(null);
+        return;
+      }
+      if (msg.type === 'ENROLL_DONE') {
+        const { ok, message } = msg.payload as { ok: boolean; message: string };
+        setEnrollPercent(null);
+        setEnrollNote('');
+        setEnrollResult({ ok, message });
+        return;
+      }
       if (msg.type !== 'SETUP_STATUS') {
         return;
       }
       const payload = msg.payload as SetupStatus;
+      setGate(payload.speakerGate ?? { moduleOk: false, hasProfile: false });
+      setPvKeyStored(!!payload.picovoiceKey);
+      if (payload.picovoiceKey) {
+        // Stored — drop the plaintext copy from the box.
+        setPvKeyInput('');
+      }
       setApiKeyStatus(
         payload.geminiKey ? 'ok' : payload.apiKeyError ? 'error' : 'pending'
       );
@@ -191,6 +236,13 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
     setLanguage(code);
     postToExtension({ type: 'SET_LANGUAGE', payload: { language: code } });
   }
+
+  function handleSavePvKey() {
+    postToExtension({ type: 'SAVE_PICOVOICE_KEY', payload: { key: pvKeyInput.trim() } });
+    setEnrollResult(null);
+  }
+
+  const enrolling = enrollPercent !== null;
 
   function handleSpeakToggle(enabled: boolean) {
     setSpeakResponses(enabled);
@@ -419,6 +471,161 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
                 Only models that support a live bidirectional session are listed. Voices come from
                 Google&apos;s published set; a few may not be offered on every model.
               </p>
+            </>
+          )}
+        </div>
+
+        {/* Only my voice — speaker verification, so a shared room cannot drive Tara */}
+        <div className="setup-card">
+          <div className="setup-card-header">
+            <span className="setup-card-icon">🔒</span>
+            <div className="setup-card-title-wrap">
+              <span className="setup-card-title">Only my voice</span>
+              <span className="setup-card-desc">
+                {gate.hasProfile
+                  ? 'Enrolled — Tara ignores everyone else'
+                  : 'Optional. Without this, Tara answers anyone in the room'}
+              </span>
+            </div>
+          </div>
+
+          {!gate.moduleOk ? (
+            <p className="setup-card-hint">
+              ✕ Speaker recognition is unavailable on this platform
+              {gate.moduleError ? `: ${gate.moduleError}` : '.'}
+            </p>
+          ) : (
+            <>
+              {!pvKeyStored ? (
+                <>
+                  <div className="setup-card-action">
+                    <input
+                      className="setup-input"
+                      type="password"
+                      placeholder="Picovoice AccessKey"
+                      value={pvKeyInput}
+                      onChange={(e) => setPvKeyInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') handleSavePvKey();
+                      }}
+                    />
+                    <button
+                      className="setup-btn setup-btn-primary"
+                      onClick={handleSavePvKey}
+                      disabled={!pvKeyInput.trim()}
+                    >
+                      Save
+                    </button>
+                  </div>
+                  <p className="setup-card-hint">
+                    Free from{' '}
+                    <a
+                      href="#"
+                      onClick={(e) => {
+                        e.preventDefault();
+                        postToExtension({
+                          type: 'OPEN_URL',
+                          payload: { url: 'https://console.picovoice.ai/' },
+                        });
+                      }}
+                    >
+                      console.picovoice.ai
+                    </a>
+                    . It stays on this machine — the voice matching runs offline.
+                  </p>
+                </>
+              ) : (
+                <>
+                  {enrolling ? (
+                    <>
+                      <div className="setup-enroll-bar">
+                        <div
+                          className="setup-enroll-fill"
+                          style={{ width: `${Math.min(100, enrollPercent ?? 0)}%` }}
+                        />
+                      </div>
+                      <p className="setup-card-hint">
+                        {Math.round(enrollPercent ?? 0)}% — {enrollNote || 'Keep talking.'}
+                      </p>
+                      <div className="setup-card-action">
+                        <button
+                          className="setup-btn setup-btn-primary"
+                          onClick={() => postToExtension({ type: 'ENROLL_STOP', payload: {} })}
+                        >
+                          Done
+                        </button>
+                        <button
+                          className="setup-btn"
+                          onClick={() => postToExtension({ type: 'ENROLL_CANCEL', payload: {} })}
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          className="setup-btn"
+                          onClick={() =>
+                            postToExtension({ type: 'ENROLL_FROM_FILE', payload: {} })
+                          }
+                        >
+                          Add a file
+                        </button>
+                      </div>
+                    </>
+                  ) : (
+                    <div className="setup-card-action">
+                      <button
+                        className="setup-btn setup-btn-primary"
+                        onClick={() => postToExtension({ type: 'ENROLL_FROM_FILE', payload: {} })}
+                      >
+                        Use a voice file
+                      </button>
+                      <button
+                        className="setup-btn"
+                        onClick={() => postToExtension({ type: 'ENROLL_START', payload: {} })}
+                      >
+                        {gate.hasProfile ? 'Re-record' : 'Record now'}
+                      </button>
+                      {gate.hasProfile && (
+                        <button
+                          className="setup-btn"
+                          onClick={() =>
+                            postToExtension({ type: 'DELETE_VOICE_PROFILE', payload: {} })
+                          }
+                        >
+                          Forget
+                        </button>
+                      )}
+                    </div>
+                  )}
+
+                  {enrollResult && (
+                    <p
+                      className={
+                        enrollResult.ok ? 'setup-card-ok-msg' : 'setup-card-error-msg'
+                      }
+                    >
+                      {enrollResult.ok ? '✓' : '✕'} {enrollResult.message}
+                    </p>
+                  )}
+
+                  {gate.hasProfile && !enrolling && !enrollResult && (
+                    <p className="setup-card-ok-msg">
+                      ✓ Enrolled
+                      {gate.enrolledSeconds ? ` from ${gate.enrolledSeconds}s of speech` : ''}
+                      {gate.enrolledAt
+                        ? ` on ${new Date(gate.enrolledAt).toLocaleDateString()}`
+                        : ''}
+                      .
+                    </p>
+                  )}
+
+                  <p className="setup-card-hint">
+                    A recording needs about half a minute of speech — the engine decides when it
+                    has heard enough, and a short clip can be topped up with another. If your own
+                    voice starts getting ignored, lower <code>tara.speakerMatchThreshold</code>;
+                    rejected attempts print their score in the chat.
+                  </p>
+                </>
+              )}
             </>
           )}
         </div>

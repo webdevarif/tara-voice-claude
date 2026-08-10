@@ -2,7 +2,7 @@
   "name": "tara-vscode",
   "displayName": "Tara — Voice AI Coding Assistant",
   "description": "Voice-controlled AI coding assistant powered by Gemini Live + Claude Code",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "tara",
   "author": "Tara",
   "license": "MIT",
@@ -163,6 +163,14 @@
           "default": true,
           "description": "Speak agent answers, clarifying questions and warnings aloud."
         },
+        "tara.speakerMatchThreshold": {
+          "type": "number",
+          "default": 0.5,
+          "minimum": 0.05,
+          "maximum": 0.99,
+          "markdownDescription": "How closely a voice must match your enrolled profile before Tara acts on it, from 0 to 1. Only used once you have enrolled a voice on the setup screen; with no profile Tara answers everyone. Raise it if other people in the room get through; lower it if your own voice is being ignored — a cold, a headset, or sitting further from the microphone all push the score down. A rejected score is printed in the chat, so you can see what to aim at.",
+          "description": "Minimum voice-match score (0–1) before Tara acts on what it hears."
+        },
         "tara.voiceMode": {
           "type": "string",
           "enum": [
@@ -222,6 +230,7 @@
     "typescript": "^5.4.0"
   },
   "dependencies": {
+    "@picovoice/eagle-node": "^3.0.1",
     "@picovoice/pvrecorder-node": "^1.2.9",
     "@picovoice/pvspeaker-node": "^1.0.3",
     "ws": "^8.17.0"

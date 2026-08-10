@@ -23,6 +23,13 @@ import {
 } from '../voice/MicRecorder';
 import { verifyGeminiKey } from '../voice/GeminiKeyCheck';
 import { Vad, chunkRms } from '../voice/Vad';
+import {
+  SpeakerEnrollment,
+  SpeakerGate,
+  SpeakerGateProbe,
+  decodeToPcm16k,
+  probeSpeakerGate,
+} from '../voice/SpeakerGate';
 import { ConversationStore } from '../history/ConversationStore';
 import {
   AudioOutputDevice,
@@ -41,6 +48,12 @@ import { AgentStatus, ChatEntry, TaraMessage, isRiskyCommand } from '../types';
 
 /** SecretStorage key. Superseded the `tara.geminiApiKey` setting, which leaked via settings sync. */
 const SECRET_GEMINI_KEY = 'tara.geminiApiKey';
+/**
+ * Picovoice AccessKey, for the speaker gate. In SecretStorage rather than a
+ * setting for the same reason the Gemini key is: a plaintext setting travels
+ * through Settings Sync.
+ */
+const SECRET_PICOVOICE_KEY = 'tara.picovoiceAccessKey';
 const STATE_SETUP_COMPLETE = 'tara.setupComplete';
 const STATE_MIC_DEVICE = 'tara.micDeviceId';
 const STATE_SPEAKER_DEVICE = 'tara.speakerDeviceId';
@@ -103,6 +116,13 @@ interface SetupStatus {
   language: string;
   languageOptions: LanguageOption[];
   speakResponses: boolean;
+  /** Module availability and whether a voice is enrolled. */
+  speakerGate: SpeakerGateProbe;
+  /** Whether a Picovoice AccessKey is stored. Never the key itself. */
+  picovoiceKey: boolean;
+  /** Live enrolment progress, 0–100, while one is running. */
+  enrollPercent?: number;
+  enrollError?: string;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -128,6 +148,11 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   private readonly store: ConversationStore;
   /** Playback, also in this process — see SpeakerPlayer's header for why. */
   private readonly speaker = new SpeakerPlayer();
+  /**
+   * Whose voice this is. Off until a profile is enrolled, and off is the old
+   * behaviour — answering the whole room.
+   */
+  private readonly speakerGate = new SpeakerGate();
   /** Cached from the last setup check so a press does not re-probe. */
   private micDevices: AudioInputDevice[] = [];
   private bytesThisUtterance = 0;
@@ -743,6 +768,346 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     this.postMessage({ type: 'TTS_DONE', payload: {} });
   }
 
+  // ── Speaker gate ───────────────────────────────────────────────────────────
+  //
+  // The VAD says *someone* is talking. This decides whether that someone is the
+  // person who enrolled, and it runs before a socket is opened rather than after,
+  // because opening one would bill a connection for a stranger's sentence — half
+  // of what the gate is for. The other half is that a colleague's remark used to
+  // become a transcript, and a transcript becomes a tool call.
+  //
+  // The cost is latency at the start of an utterance: nothing is sent until
+  // roughly the first second has been scored. The pre-roll and the scored window
+  // are then sent as the opening audio, so the delay does not eat the first words
+  // — see openTurn.
+
+  /** True between speech starting and the voice being judged. */
+  private verifying = false;
+  private verifyBuf: Buffer[] = [];
+  private verifyBytes = 0;
+  /** This utterance was judged to be someone else; drop the rest of it. */
+  private rejected = false;
+  /** Live enrolment, when running. The microphone feeds this instead of the gate. */
+  private enrollment?: SpeakerEnrollment;
+  /** When a rejection was last explained, so a busy room is not narrated. */
+  private rejectionNoted = 0;
+
+  /**
+   * How long to keep scoring before giving up. Eagle returns null while it cannot
+   * find a voice in the window; three seconds of that is a door, a keyboard or a
+   * fan, not somebody talking to us.
+   */
+  private static readonly VERIFY_GIVE_UP_BYTES = 16000 * 2 * 3;
+
+  private gateThreshold(): number {
+    const raw = vscode.workspace
+      .getConfiguration('tara')
+      .get<number>('speakerMatchThreshold', 0.5);
+    // Clamped rather than trusted: 0 would admit everyone while looking enabled,
+    // and above 1 would reject the enrolled speaker forever.
+    return Math.min(0.99, Math.max(0.05, raw));
+  }
+
+  /** Opens the engine, if there is both a key and an enrolled profile. */
+  private async armGate() {
+    if (!this.speakerGate.available || this.speakerGate.armed) {
+      return;
+    }
+    const key = (await this.context.secrets.get(SECRET_PICOVOICE_KEY)) ?? '';
+    if (!key) {
+      return;
+    }
+    if (!this.speakerGate.arm(key) && this.speakerGate.error) {
+      this.addSystemMessage(
+        `Only-my-voice could not start, so Tara is listening to everyone: ${this.speakerGate.error}`
+      );
+    }
+  }
+
+  /** Accumulates audio until there is enough of it to judge, then judges. */
+  private collectForVerify(chunk: Buffer) {
+    this.verifyBuf.push(chunk);
+    this.verifyBytes += chunk.length;
+
+    const min = this.speakerGate.minVerifyBytes;
+    if (min <= 0 || this.verifyBytes < min) {
+      return;
+    }
+
+    const window = Buffer.concat(this.verifyBuf);
+    const score = this.speakerGate.verify(window);
+    if (score === null) {
+      if (this.verifyBytes >= ChatPanelProvider.VERIFY_GIVE_UP_BYTES) {
+        this.rejectUtterance(null);
+      }
+      return;
+    }
+    if (score >= this.gateThreshold()) {
+      void this.acceptUtterance(window);
+    } else {
+      this.rejectUtterance(score);
+    }
+  }
+
+  private async acceptUtterance(window: Buffer) {
+    this.verifying = false;
+    this.verifyBuf = [];
+    this.verifyBytes = 0;
+    await this.openTurn(window);
+  }
+
+  private rejectUtterance(score: number | null) {
+    this.verifying = false;
+    this.rejected = true;
+    this.verifyBuf = [];
+    this.verifyBytes = 0;
+    this.postMicState();
+
+    // At most once a minute. A gate working correctly in a shared room rejects
+    // constantly, and a line per rejection would bury the conversation it exists
+    // to protect — while total silence would look like the microphone is broken.
+    const now = Date.now();
+    if (now - this.rejectionNoted < 60000) {
+      return;
+    }
+    this.rejectionNoted = now;
+    this.addSystemMessage(
+      score === null
+        ? 'Heard a sound with no voice in it — ignored.'
+        : `That was not your voice (match ${score.toFixed(2)} against ${this.gateThreshold().toFixed(2)}) — ignored.`
+    );
+  }
+
+  /** Clears per-utterance verification state. Called when speech ends, either way. */
+  private resetVerify() {
+    this.verifying = false;
+    this.rejected = false;
+    this.verifyBuf = [];
+    this.verifyBytes = 0;
+  }
+
+  // ── Enrolment ──────────────────────────────────────────────────────────────
+  //
+  // Two ways in, because neither alone is enough.
+  //
+  // A file is what was asked for and is the least effort where one already exists.
+  // But Eagle decides for itself when it has heard enough, and a short voice memo
+  // frequently is not — so file enrolment has to be able to answer "that was only
+  // 40% of a profile", and then the user needs somewhere to go.
+  //
+  // Live enrolment is that somewhere: read aloud until the bar fills. It also
+  // sidesteps decoding and resampling entirely, because the microphone already
+  // produces exactly the 16 kHz mono the engine wants.
+
+  private async picovoiceKey(): Promise<string> {
+    return (await this.context.secrets.get(SECRET_PICOVOICE_KEY)) ?? '';
+  }
+
+  private postEnrollProgress(percent: number, seconds: number, note?: string) {
+    this.postMessage({
+      type: 'ENROLL_PROGRESS',
+      payload: { percent: Math.round(percent), seconds: Math.round(seconds * 10) / 10, note },
+    });
+  }
+
+  private feedEnrollment(chunk: Buffer) {
+    const session = this.enrollment;
+    if (!session) {
+      return;
+    }
+    try {
+      const percent = session.push(chunk);
+      this.postEnrollProgress(percent, session.seconds);
+      if (percent >= 100) {
+        void this.finishEnrollment();
+      }
+    } catch (err) {
+      this.failEnrollment(err);
+    }
+  }
+
+  /** Starts reading the microphone into a new profile. Turns the mic on if it is off. */
+  private async startLiveEnrollment() {
+    if (this.enrollment) {
+      return;
+    }
+    const key = await this.picovoiceKey();
+    if (!this.speakerGate.available || !key) {
+      this.postMessage({
+        type: 'ENROLL_DONE',
+        payload: {
+          ok: false,
+          message: key
+            ? (this.speakerGate.moduleError ??
+              'Speaker recognition is not available on this platform.')
+            : 'Add a Picovoice AccessKey first — it is free from console.picovoice.ai.',
+        },
+      });
+      return;
+    }
+
+    try {
+      this.enrollment = new SpeakerEnrollment(key);
+    } catch (err) {
+      this.failEnrollment(err);
+      return;
+    }
+
+    // The gate must not run during enrolment: it would be scoring the very voice
+    // being learned against the old profile, and on a first enrolment there is no
+    // profile to score against at all.
+    this.speakerGate.disarm();
+    this.postEnrollProgress(0, 0, 'Keep talking — read anything aloud.');
+
+    if (!this.micEnabled) {
+      await this.setMicEnabled(true);
+      if (!this.micEnabled) {
+        // setMicEnabled already explained why.
+        this.enrollment?.release();
+        this.enrollment = undefined;
+      }
+    }
+  }
+
+  private async finishEnrollment() {
+    const session = this.enrollment;
+    this.enrollment = undefined;
+    if (!session) {
+      return;
+    }
+    let result: ReturnType<SpeakerEnrollment['finish']>;
+    try {
+      result = session.finish();
+    } catch (err) {
+      this.failEnrollment(err);
+      return;
+    }
+
+    if (!result) {
+      // Not enough speech. Deliberately not saved: a partial profile is what
+      // starts rejecting its owner, which is the worst failure this feature has.
+      this.postMessage({
+        type: 'ENROLL_DONE',
+        payload: {
+          ok: false,
+          percent: session.percentage,
+          message:
+            `Only got to ${Math.round(session.percentage)}%. Eagle needs more speech than that — ` +
+            'keep going, or add a longer recording.',
+        },
+      });
+      await this.runSetupCheck();
+      return;
+    }
+
+    this.speakerGate.saveProfile(result.profile, result.seconds, result.engineVersion);
+    await this.armGate();
+    this.postMessage({
+      type: 'ENROLL_DONE',
+      payload: {
+        ok: true,
+        percent: 100,
+        message: `Voice enrolled from ${result.seconds.toFixed(1)}s of speech. Tara now answers only you.`,
+      },
+    });
+    await this.runSetupCheck();
+  }
+
+  private cancelEnrollment() {
+    const session = this.enrollment;
+    this.enrollment = undefined;
+    session?.release();
+    void this.armGate();
+    this.postMessage({
+      type: 'ENROLL_DONE',
+      payload: { ok: false, message: 'Enrolment cancelled.' },
+    });
+  }
+
+  private failEnrollment(err: unknown) {
+    const session = this.enrollment;
+    this.enrollment = undefined;
+    session?.release();
+    const message = err instanceof Error ? err.message : String(err);
+    this.postMessage({
+      type: 'ENROLL_DONE',
+      payload: {
+        ok: false,
+        // An invalid AccessKey is by far the most common cause, and Eagle's own
+        // message does not say so.
+        message: /AccessKey|activation|initialize/i.test(message)
+          ? `${message} — check the Picovoice AccessKey.`
+          : message,
+      },
+    });
+  }
+
+  /**
+   * Enrols from an audio file. Adds to whatever a running enrolment has already
+   * heard rather than replacing it, so two short recordings can make one profile.
+   */
+  private async enrollFromFile(filePath: string) {
+    const key = await this.picovoiceKey();
+    if (!key) {
+      this.postMessage({
+        type: 'ENROLL_DONE',
+        payload: {
+          ok: false,
+          message: 'Add a Picovoice AccessKey first — it is free from console.picovoice.ai.',
+        },
+      });
+      return;
+    }
+
+    let pcm: Buffer;
+    let via: 'wav' | 'ffmpeg';
+    try {
+      ({ pcm, via } = await decodeToPcm16k(filePath, this.ffmpegPath()));
+    } catch (err) {
+      this.postMessage({
+        type: 'ENROLL_DONE',
+        payload: { ok: false, message: err instanceof Error ? err.message : String(err) },
+      });
+      return;
+    }
+
+    if (!this.enrollment) {
+      try {
+        this.enrollment = new SpeakerEnrollment(key);
+      } catch (err) {
+        this.failEnrollment(err);
+        return;
+      }
+      this.speakerGate.disarm();
+    }
+
+    const seconds = pcm.length / 2 / 16000;
+    this.addSystemMessage(
+      `Read ${seconds.toFixed(1)}s from ${path.basename(filePath)} (${via}) for enrolment.`
+    );
+    let percent: number;
+    try {
+      percent = this.enrollment.push(pcm);
+    } catch (err) {
+      this.failEnrollment(err);
+      return;
+    }
+
+    if (percent >= 100) {
+      await this.finishEnrollment();
+      return;
+    }
+
+    // Left open on purpose. Finishing here would release the session, and the
+    // next file would start again from zero — so two short recordings could never
+    // add up to one profile, which is exactly the case a short voice memo creates.
+    this.postEnrollProgress(
+      percent,
+      this.enrollment.seconds,
+      `${Math.round(percent)}% so far — add another recording, or press Record and keep talking.`
+    );
+  }
+
   private get outputBusy(): boolean {
     return Date.now() < this.outputBusyUntil + ChatPanelProvider.ECHO_TAIL_MS;
   }
@@ -878,7 +1243,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     if (!this.awake) {
       return 'asleep';
     }
-    return this.streaming ? 'hearing' : 'listening';
+    // Verifying counts as hearing: something *is* being heard, and the orb showing
+    // activity while the voice is checked is accurate rather than flattering.
+    return this.streaming || this.verifying ? 'hearing' : 'listening';
   }
 
   private postMicState() {
@@ -927,8 +1294,12 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     }
 
     this.vad.reset();
+    this.resetVerify();
     this.awake = true;
     this.micEnabled = true;
+    // Before the recorder starts, so the first sentence is gated too rather than
+    // slipping through while the engine is still opening.
+    await this.armGate();
     this.postMicState();
 
     try {
@@ -950,6 +1321,13 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   /** Every captured chunk passes through here, whether or not it is sent on. */
   private handleAudioChunk(chunk: Buffer) {
     if (!this.micEnabled) {
+      return;
+    }
+
+    // A live enrolment owns the microphone outright: this audio is training data,
+    // not a command, and must reach neither the gate nor the network.
+    if (this.enrollment) {
+      this.feedEnrollment(chunk);
       return;
     }
     // Tara is talking. Everything the microphone hears right now is her, so it
@@ -997,6 +1375,20 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       }
       return;
     }
+    if (this.rejected) {
+      // Already judged as somebody else. Still pushed to the gate, because it is
+      // speechEnd that clears the rejection — skipping it would leave the whole
+      // session deaf after one stranger spoke.
+      this.vad.push(chunk);
+      return;
+    }
+
+    if (this.verifying) {
+      this.collectForVerify(chunk);
+      this.vad.push(chunk);
+      return;
+    }
+
     if (this.streaming) {
       this.bytesThisUtterance += chunk.length;
       this.voiceBridge?.sendAudioChunk(chunk.toString('base64'));
@@ -1017,11 +1409,37 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   }
 
   private async onSpeechStart() {
-    if (!this.micEnabled || this.streaming) {
+    if (!this.micEnabled || this.streaming || this.verifying || this.rejected) {
       return;
     }
     this.clearTimers();
 
+    const opening = Buffer.concat(this.preroll);
+    this.preroll = [];
+    this.prerollBytes = 0;
+
+    // With the gate armed, judge the voice before spending anything on it. The
+    // pre-roll is kept as the start of the window that gets scored, and then sent,
+    // so verification costs latency but never words.
+    if (this.speakerGate.armed) {
+      this.verifying = true;
+      this.verifyBuf = opening.length ? [opening] : [];
+      this.verifyBytes = opening.length;
+      this.postMicState();
+      return;
+    }
+
+    await this.openTurn(opening);
+  }
+
+  /**
+   * Opens a Gemini turn and sends `opening` as its first audio.
+   *
+   * Shared by both entry points so they cannot drift: speech that was gated and
+   * speech that was not have to send the same thing, namely everything heard since
+   * the sentence began.
+   */
+  private async openTurn(opening: Buffer) {
     const bridge = await this.getOrCreateVoiceBridge();
     if (!bridge) {
       return;
@@ -1037,11 +1455,10 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       // Speech ended while the socket was still coming up.
       return;
     }
-    for (const chunk of this.preroll) {
-      bridge.sendAudioChunk(chunk.toString('base64'));
+    if (opening.length) {
+      this.bytesThisUtterance += opening.length;
+      bridge.sendAudioChunk(opening.toString('base64'));
     }
-    this.preroll = [];
-    this.prerollBytes = 0;
 
     if (this.wakeProbe) {
       // Bound the probe: listening indefinitely to a conversation that is not
@@ -1053,6 +1470,20 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   }
 
   private async onSpeechEnd() {
+    const wasGating = this.verifying || this.rejected;
+    this.resetVerify();
+
+    if (wasGating) {
+      // Nothing was ever opened, so there is no turn to close — but the sleep
+      // timer still has to be re-armed, or a room full of other people's speech
+      // would keep Tara awake indefinitely without her ever being addressed.
+      this.postMicState();
+      if (this.micEnabled && this.awake) {
+        this.armSleepTimer();
+      }
+      return;
+    }
+
     if (!this.streaming) {
       return;
     }
@@ -1287,6 +1718,61 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         break;
       }
 
+      case 'SAVE_PICOVOICE_KEY': {
+        const { key } = msg.payload as { key?: string };
+        const trimmed = (key ?? '').trim();
+        if (trimmed) {
+          await this.context.secrets.store(SECRET_PICOVOICE_KEY, trimmed);
+        } else {
+          await this.context.secrets.delete(SECRET_PICOVOICE_KEY);
+        }
+        // Not verified before storing, unlike the Gemini key: Picovoice has no
+        // cheap validation endpoint, and the key is proven by the next enrolment,
+        // whose error is surfaced. A bad key here costs a clear message, not a
+        // silent failure mid-utterance.
+        this.speakerGate.disarm();
+        await this.armGate();
+        await this.runSetupCheck();
+        break;
+      }
+
+      case 'ENROLL_FROM_FILE': {
+        const picked = await vscode.window.showOpenDialog({
+          canSelectMany: false,
+          openLabel: 'Use for enrolment',
+          filters: { Audio: ['wav', 'mp3', 'm4a', 'aac', 'ogg', 'opus', 'flac', 'webm'] },
+        });
+        const file = picked?.[0]?.fsPath;
+        if (file) {
+          await this.enrollFromFile(file);
+        }
+        break;
+      }
+
+      case 'ENROLL_START': {
+        await this.startLiveEnrollment();
+        break;
+      }
+
+      case 'ENROLL_STOP': {
+        // Stop means "use what you have", which may be short — finishEnrollment
+        // reports that rather than saving a half-trained profile.
+        await this.finishEnrollment();
+        break;
+      }
+
+      case 'ENROLL_CANCEL': {
+        this.cancelEnrollment();
+        break;
+      }
+
+      case 'DELETE_VOICE_PROFILE': {
+        this.speakerGate.deleteProfile();
+        this.addSystemMessage('Voice profile deleted — Tara is listening to everyone again.');
+        await this.runSetupCheck();
+        break;
+      }
+
       case 'SET_LANGUAGE': {
         const { language } = msg.payload as { language?: string };
         await this.updateVoiceSetting('language', language);
@@ -1303,7 +1789,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         const { url } = msg.payload as { url: string };
         // Only follow links we generated — never an arbitrary string from the webview.
         if (
-          /^https:\/\/(aistudio\.google\.com|ai\.google\.dev|docs\.anthropic\.com)\//.test(url)
+          /^https:\/\/(aistudio\.google\.com|ai\.google\.dev|docs\.anthropic\.com|console\.picovoice\.ai)\//.test(
+            url
+          )
         ) {
           void vscode.env.openExternal(vscode.Uri.parse(url));
         }
@@ -1482,6 +1970,8 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       language: config.get<string>('language') || 'auto',
       languageOptions: SPOKEN_LANGUAGES,
       speakResponses: config.get<boolean>('speakResponses', true),
+      speakerGate: probeSpeakerGate(),
+      picovoiceKey: !!(await this.picovoiceKey()),
     };
 
     // Only ask for the model list once the key has earned it; an unverified key

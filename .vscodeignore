@@ -11,6 +11,16 @@ node_modules/@picovoice/pvrecorder-node/jest.config.js
 node_modules/@picovoice/pvrecorder-node/tsconfig.json
 node_modules/@picovoice/pvrecorder-node/.eslint*
 node_modules/@picovoice/pvrecorder-node/.prettierrc
+# Same for @picovoice/eagle-node, whose lib/ is the speaker-recognition engine:
+# lib/common holds the model (.pv) and the four platform folders hold the native
+# binaries. Dropping any of them would break the voice gate on that platform
+# only, which is the worst kind of packaging bug — it passes on the machine that
+# built it. So only source, tests and build config go.
+node_modules/@picovoice/eagle-node/src/**
+node_modules/@picovoice/eagle-node/test/**
+node_modules/@picovoice/eagle-node/copy.js
+node_modules/@picovoice/eagle-node/jest.config.js
+node_modules/@picovoice/eagle-node/tsconfig.json
 .vscode/**
 .vscode-test/**
 src/**
