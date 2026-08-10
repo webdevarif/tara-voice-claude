@@ -1,31 +1,86 @@
 import * as vscode from 'vscode';
-import { AgentOrchestrator } from '../execution/AgentOrchestrator';
-import { GeminiVoiceBridge } from '../voice/GeminiVoiceBridge';
-import { TaraMessage, ChatEntry, isRiskyCommand } from '../types';
 import * as fs from 'fs';
 import * as path from 'path';
+import { execFile } from 'child_process';
+import {
+  AgentOrchestrator,
+  AgentOutput,
+  buildLaunchSpec,
+} from '../execution/AgentOrchestrator';
+import { GeminiVoiceBridge, VoiceState } from '../voice/GeminiVoiceBridge';
+import { AgentStatus, ChatEntry, TaraMessage, isRiskyCommand } from '../types';
+
+/** SecretStorage key. Superseded the `tara.geminiApiKey` setting, which leaked via settings sync. */
+const SECRET_GEMINI_KEY = 'tara.geminiApiKey';
+const STATE_SETUP_COMPLETE = 'tara.setupComplete';
+const STATE_MIC_DEVICE = 'tara.micDeviceId';
+
+/** Keeps the retained webview from growing without bound over a long session. */
+const MAX_HISTORY_ENTRIES = 400;
+
+interface SetupStatus {
+  geminiKey: boolean;
+  claudeInstalled: boolean;
+  claudeVersion?: string;
+  claudeAuthed: boolean;
+  claudeAuthDetail?: string;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ChatPanelProvider — Webview panel for the Tara chat UI
+// ChatPanelProvider — webview host for the Tara chat UI
 // ─────────────────────────────────────────────────────────────────────────────
 export class ChatPanelProvider implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
   private voiceBridge?: GeminiVoiceBridge;
   private history: ChatEntry[] = [];
-  private context: vscode.ExtensionContext;
-  private orchestrator: AgentOrchestrator;
-  private pendingConfirmation?: { prompt: string; agentId?: string };
+  private pendingConfirmation?: { prompt: string; replyToAgentId?: string };
+  private viewDisposables: vscode.Disposable[] = [];
+  /**
+   * Set when VOICE_STOP arrives while VOICE_START is still awaiting the bridge.
+   * Without it, the stop hits an undefined bridge and is lost, leaving the
+   * session listening forever and never finalizing the utterance.
+   */
+  private voiceStopPending = false;
 
-  constructor(context: vscode.ExtensionContext, orchestrator: AgentOrchestrator) {
-    this.context = context;
-    this.orchestrator = orchestrator;
+  constructor(
+    private readonly context: vscode.ExtensionContext,
+    private readonly orchestrator: AgentOrchestrator
+  ) {
+    // Wired once, in the constructor. Doing this in resolveWebviewView would add
+    // a duplicate listener every time the view is recreated.
+    this.orchestrator.onOutput((agentId, data) => this.handleAgentOutput(agentId, data));
+
+    this.orchestrator.onStatusChange((status: AgentStatus) => {
+      this.postMessage({
+        type: 'AGENT_STATUS',
+        payload: {
+          status,
+          awaitingInput: this.orchestrator.hasAgentAwaitingInput(),
+        },
+      });
+    });
+
+    this.orchestrator.onQuestion((agentId, title, question) => {
+      // The question text already reached the transcript as AGENT_OUTPUT; this
+      // message only tells the UI that a reply is expected, and from whom.
+      this.postMessage({
+        type: 'AGENT_QUESTION',
+        payload: { agentId, title, question },
+      });
+      void this.speak(question);
+      void vscode.window
+        .showInformationMessage(`Tara needs an answer — "${title}"`, 'Open Chat')
+        .then((choice) => {
+          if (choice === 'Open Chat') {
+            void vscode.commands.executeCommand('tara.chatView.focus');
+          }
+        });
+    });
   }
 
-  resolveWebviewView(
-    webviewView: vscode.WebviewView,
-    _context: vscode.WebviewViewResolveContext,
-    _token: vscode.CancellationToken
-  ) {
+  // ── Webview lifecycle ──────────────────────────────────────────────────────
+
+  resolveWebviewView(webviewView: vscode.WebviewView) {
     this.view = webviewView;
 
     webviewView.webview.options = {
@@ -33,135 +88,269 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       localResourceRoots: [
         vscode.Uri.joinPath(this.context.extensionUri, 'media'),
         vscode.Uri.joinPath(this.context.extensionUri, 'webview-ui', 'dist'),
-        vscode.Uri.joinPath(this.context.extensionUri, 'webview-ui'),
       ],
     };
 
     webviewView.webview.html = this.buildHtml(webviewView.webview);
 
-    // Handle messages from webview
-    webviewView.webview.onDidReceiveMessage(
-      (msg: TaraMessage) => this.handleWebviewMessage(msg),
-      null,
-      this.context.subscriptions
+    // Scoped to this view instance so a recreated view does not stack handlers.
+    this.disposeViewListeners();
+    this.viewDisposables.push(
+      webviewView.webview.onDidReceiveMessage((msg: TaraMessage) => {
+        // A rejection here used to vanish, which could leave the setup screen
+        // spinning with no explanation.
+        void this.handleWebviewMessage(msg).catch((err: unknown) => {
+          const message = err instanceof Error ? err.message : String(err);
+          this.postMessage({ type: 'ERROR', payload: { message } });
+        });
+      }),
+      webviewView.onDidChangeVisibility(() => {
+        void vscode.commands.executeCommand(
+          'setContext',
+          'tara.chatViewFocused',
+          webviewView.visible
+        );
+      }),
+      webviewView.onDidDispose(() => {
+        this.disposeViewListeners();
+        this.view = undefined;
+      })
     );
 
-    // Focus context key
-    webviewView.onDidChangeVisibility(() => {
-      vscode.commands.executeCommand(
-        'setContext',
-        'tara.chatViewFocused',
-        webviewView.visible
-      );
+    void this.postInit();
+  }
+
+  private disposeViewListeners() {
+    for (const d of this.viewDisposables) {
+      d.dispose();
+    }
+    this.viewDisposables = [];
+  }
+
+  private async postInit() {
+    this.postMessage({
+      type: 'INIT',
+      payload: {
+        history: this.history,
+        setupComplete: this.context.globalState.get<boolean>(STATE_SETUP_COMPLETE, false),
+        micDeviceId: this.context.globalState.get<string>(STATE_MIC_DEVICE, ''),
+        agentStatus: this.orchestrator.aggregateStatus(),
+        awaitingInput: this.orchestrator.hasAgentAwaitingInput(),
+      },
     });
+  }
 
-    // Settings button in panel toolbar
-    webviewView.title = 'Chat';
-    webviewView.description = '';
+  // ── Secrets ────────────────────────────────────────────────────────────────
 
-    // Send initial state
-    this.postMessage({ type: 'INIT', payload: { history: this.history } });
+  /**
+   * Reads the key from SecretStorage, migrating it out of settings on first run.
+   * The old `tara.geminiApiKey` setting travelled through Settings Sync in
+   * plaintext, so it is cleared once copied.
+   */
+  private async getApiKey(): Promise<string> {
+    const stored = await this.context.secrets.get(SECRET_GEMINI_KEY);
+    if (stored) {
+      return stored;
+    }
 
-    // Set up orchestrator output → chat panel
-    this.orchestrator.onOutput((agentId, data) => {
-      const entry: ChatEntry = {
-        id: `${agentId}-${Date.now()}`,
-        role: 'claude',
-        content: data.text,
-        timestamp: Date.now(),
-      };
-      this.history.push(entry);
-      this.postMessage({ type: 'AGENT_OUTPUT', payload: { agentId, ...data } });
-    });
+    const config = vscode.workspace.getConfiguration('tara');
+    const legacy = (config.get<string>('geminiApiKey') ?? '').trim();
+    if (!legacy) {
+      return '';
+    }
+
+    await this.context.secrets.store(SECRET_GEMINI_KEY, legacy);
+    for (const target of [
+      vscode.ConfigurationTarget.Global,
+      vscode.ConfigurationTarget.Workspace,
+      vscode.ConfigurationTarget.WorkspaceFolder,
+    ]) {
+      try {
+        await config.update('geminiApiKey', undefined, target);
+      } catch {
+        // Not set at that scope — nothing to clear.
+      }
+    }
+    return legacy;
+  }
+
+  private async setApiKey(key: string) {
+    const trimmed = key.trim();
+    if (trimmed) {
+      await this.context.secrets.store(SECRET_GEMINI_KEY, trimmed);
+    } else {
+      await this.context.secrets.delete(SECRET_GEMINI_KEY);
+    }
   }
 
   // ── Voice ──────────────────────────────────────────────────────────────────
 
+  private voiceDisabled(): boolean {
+    return (
+      vscode.workspace.getConfiguration('tara').get<string>('voiceMode', 'push-to-talk') ===
+      'disabled'
+    );
+  }
+
   triggerVoiceStart() {
+    if (this.voiceDisabled()) {
+      void vscode.window.showInformationMessage(
+        'Tara: voice input is disabled. Set "tara.voiceMode" to "push-to-talk" to enable it.'
+      );
+      return;
+    }
     this.postMessage({ type: 'AGENT_STATUS', payload: { action: 'triggerVoice' } });
   }
 
-  private async getOrCreateVoiceBridge(): Promise<GeminiVoiceBridge | null> {
+  private async getOrCreateVoiceBridge(): Promise<GeminiVoiceBridge | undefined> {
     if (this.voiceBridge) {
       return this.voiceBridge;
     }
 
-    const apiKey = vscode.workspace
-      .getConfiguration('tara')
-      .get<string>('geminiApiKey', '');
-
+    const apiKey = await this.getApiKey();
     if (!apiKey) {
-      const action = await vscode.window.showErrorMessage(
-        'Tara: Gemini API key not set. Please configure it in settings.',
-        'Open Settings'
-      );
-      if (action === 'Open Settings') {
-        vscode.commands.executeCommand(
-          'workbench.action.openSettings',
-          'tara.geminiApiKey'
-        );
-      }
-      return null;
+      this.postMessage({
+        type: 'ERROR',
+        payload: { message: 'Gemini API key is not set — add it in Tara setup.' },
+      });
+      return undefined;
     }
 
-    this.voiceBridge = new GeminiVoiceBridge(apiKey);
-
-    this.voiceBridge.on('transcriptToken', (token: string) => {
-      this.postMessage({ type: 'TRANSCRIPT_TOKEN', payload: { token } });
+    const config = vscode.workspace.getConfiguration('tara');
+    const bridge = new GeminiVoiceBridge({
+      apiKey,
+      model: config.get<string>('geminiLiveModel', ''),
+      voiceName: config.get<string>('voiceName', 'Aoede'),
     });
 
-    this.voiceBridge.on('transcriptDone', (transcript: string) => {
+    bridge.on('state', (state: VoiceState) => {
+      this.postMessage({ type: 'VOICE_STATE', payload: { state } });
+    });
+    bridge.on('transcriptPartial', (text: string) => {
+      this.postMessage({
+        type: 'TRANSCRIPT_TOKEN',
+        payload: { token: text, partial: true },
+      });
+    });
+    bridge.on('transcriptToken', (text: string) => {
+      this.postMessage({ type: 'TRANSCRIPT_TOKEN', payload: { token: text } });
+    });
+    bridge.on('transcriptDone', (transcript: string) => {
       this.postMessage({ type: 'TRANSCRIPT_DONE', payload: { transcript } });
-      // Auto-execute the transcript as a command
-      this.executeCommand(transcript);
+      void this.submitUserText(transcript);
     });
-
-    this.voiceBridge.on('ttsChunk', (base64: string) => {
+    bridge.on('ttsChunk', (base64: string) => {
       this.postMessage({ type: 'TTS_AUDIO_CHUNK', payload: { base64 } });
     });
-
-    this.voiceBridge.on('ttsDone', () => {
+    bridge.on('ttsDone', () => {
       this.postMessage({ type: 'TTS_DONE', payload: {} });
     });
-
-    this.voiceBridge.on('error', (msg: string) => {
-      this.postMessage({ type: 'ERROR', payload: { message: msg } });
+    bridge.on('error', (message: string) => {
+      this.postMessage({ type: 'ERROR', payload: { message } });
     });
 
-    await this.voiceBridge.connect();
-    return this.voiceBridge;
+    this.voiceBridge = bridge;
+    try {
+      await bridge.connect();
+    } catch (err) {
+      this.postMessage({
+        type: 'ERROR',
+        payload: {
+          message: err instanceof Error ? err.message : 'Could not reach Gemini Live.',
+        },
+      });
+      bridge.dispose();
+      this.voiceBridge = undefined;
+      return undefined;
+    }
+    return bridge;
+  }
+
+  /** Speaks `text` if voice is configured. Never creates a connection just to talk. */
+  private async speak(text: string) {
+    if (!vscode.workspace.getConfiguration('tara').get<boolean>('speakResponses', true)) {
+      return;
+    }
+    const bridge = this.voiceBridge;
+    if (!bridge) {
+      return;
+    }
+    try {
+      await bridge.speak(text);
+    } catch {
+      // Speech is a nicety — never let it break the task flow.
+    }
   }
 
   // ── Message handling ───────────────────────────────────────────────────────
 
   private async handleWebviewMessage(msg: TaraMessage) {
     switch (msg.type) {
+      case 'WEBVIEW_READY': {
+        // A postMessage sent before the webview's script has subscribed is
+        // dropped, so the webview asks for its state once it is listening.
+        await this.postInit();
+        break;
+      }
+
       case 'VOICE_START': {
+        if (this.voiceDisabled()) {
+          this.addSystemMessage('Voice input is disabled — set "tara.voiceMode" to enable it.');
+          break;
+        }
+        this.voiceStopPending = false;
         const bridge = await this.getOrCreateVoiceBridge();
-        bridge?.startListening();
+        if (!bridge) {
+          break;
+        }
+        await bridge.startListening();
+        // The release may have happened while we were connecting.
+        if (this.voiceStopPending) {
+          this.voiceStopPending = false;
+          bridge.stopListening();
+        }
         break;
       }
 
       case 'VOICE_STOP': {
-        this.voiceBridge?.stopListening();
+        if (this.voiceBridge) {
+          this.voiceBridge.stopListening();
+        } else {
+          this.voiceStopPending = true;
+        }
         break;
       }
 
       case 'VOICE_AUDIO_CHUNK': {
-        const { base64 } = msg.payload as { base64: string };
-        this.voiceBridge?.receiveAudioChunk(base64);
+        const { base64 } = msg.payload as { base64?: string };
+        if (base64) {
+          this.voiceBridge?.sendAudioChunk(base64);
+        }
         break;
       }
 
       case 'SEND_COMMAND': {
         const { text } = msg.payload as { text: string };
-        this.addUserMessage(text);
-        await this.executeCommand(text);
+        await this.submitUserText(text);
+        break;
+      }
+
+      case 'REPLY_TO_AGENT': {
+        const { text, agentId } = msg.payload as { text: string; agentId?: string };
+        this.addEntry('user', text);
+        // A reply goes straight into a live session, so it needs the same
+        // destructive-command gate as a fresh task — otherwise "yes, drop the
+        // table" reaches the agent unchecked.
+        if (this.shouldConfirm(text)) {
+          this.requestConfirmation(text, agentId);
+          break;
+        }
+        await this.forwardReply(text, agentId);
         break;
       }
 
       case 'OPEN_SETTINGS': {
-        vscode.commands.executeCommand(
+        void vscode.commands.executeCommand(
           'workbench.action.openSettings',
           '@ext:tara.tara-vscode'
         );
@@ -175,24 +364,38 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
 
       case 'SAVE_API_KEY': {
         const { key } = msg.payload as { key: string };
-        await vscode.workspace
-          .getConfiguration('tara')
-          .update('geminiApiKey', key, vscode.ConfigurationTarget.Global);
+        await this.setApiKey(key);
+        // A new key means the old connection is stale.
+        this.voiceBridge?.dispose();
+        this.voiceBridge = undefined;
         await this.runSetupCheck();
+        break;
+      }
+
+      case 'SETUP_COMPLETE': {
+        await this.context.globalState.update(STATE_SETUP_COMPLETE, true);
+        break;
+      }
+
+      case 'SET_MIC_DEVICE': {
+        const { deviceId } = msg.payload as { deviceId?: string };
+        await this.context.globalState.update(STATE_MIC_DEVICE, deviceId ?? '');
         break;
       }
 
       case 'OPEN_URL': {
         const { url } = msg.payload as { url: string };
-        vscode.env.openExternal(vscode.Uri.parse(url));
+        // Only follow links we generated — never an arbitrary string from the webview.
+        if (
+          /^https:\/\/(aistudio\.google\.com|ai\.google\.dev|docs\.anthropic\.com)\//.test(url)
+        ) {
+          void vscode.env.openExternal(vscode.Uri.parse(url));
+        }
         break;
       }
 
       case 'OPEN_MIC_SETTINGS': {
-        vscode.commands.executeCommand(
-          'workbench.action.openSettings',
-          'microphone'
-        );
+        void vscode.commands.executeCommand('workbench.action.openSettings', 'microphone');
         break;
       }
 
@@ -207,10 +410,15 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       }
 
       case 'CONFIRM_EXECUTION': {
-        if (this.pendingConfirmation) {
-          const { prompt } = this.pendingConfirmation;
-          this.pendingConfirmation = undefined;
-          await this.dispatchToOrchestrator(prompt);
+        const pending = this.pendingConfirmation;
+        this.pendingConfirmation = undefined;
+        if (!pending) {
+          break;
+        }
+        if (pending.replyToAgentId !== undefined) {
+          await this.forwardReply(pending.prompt, pending.replyToAgentId || undefined);
+        } else {
+          this.dispatchToOrchestrator(pending.prompt);
         }
         break;
       }
@@ -220,132 +428,186 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         this.addSystemMessage('Command cancelled.');
         break;
       }
+
+      default:
+        break;
     }
   }
 
-  private addUserMessage(text: string) {
-    const entry: ChatEntry = {
-      id: `user-${Date.now()}`,
-      role: 'user',
-      content: text,
+  /**
+   * A single entry point for text from either input path. If an agent is blocked
+   * on a question, the text answers it rather than starting a competing task.
+   */
+  private async submitUserText(text: string) {
+    const trimmed = text.trim();
+    if (!trimmed) {
+      return;
+    }
+    this.addEntry('user', trimmed);
+
+    if (this.orchestrator.hasAgentAwaitingInput()) {
+      const answered = this.orchestrator.replyToAgent(trimmed);
+      if (answered) {
+        return;
+      }
+    }
+    await this.executeCommand(trimmed);
+  }
+
+  private addEntry(role: ChatEntry['role'], content: string) {
+    this.history.push({
+      id: `${role}-${Date.now()}-${this.history.length}`,
+      role,
+      content,
       timestamp: Date.now(),
-    };
-    this.history.push(entry);
+    });
+    if (this.history.length > MAX_HISTORY_ENTRIES) {
+      this.history.splice(0, this.history.length - MAX_HISTORY_ENTRIES);
+    }
   }
 
   private addSystemMessage(text: string) {
-    const entry: ChatEntry = {
-      id: `sys-${Date.now()}`,
-      role: 'system',
-      content: text,
-      timestamp: Date.now(),
-    };
-    this.history.push(entry);
+    this.addEntry('system', text);
     this.postMessage({ type: 'AGENT_OUTPUT', payload: { type: 'system', text } });
   }
 
-  // ── Setup check: Gemini key + Claude CLI + Auth ──────────────────────────
-  private async runSetupCheck() {
-    const config = vscode.workspace.getConfiguration('tara');
-    const geminiKey = !!config.get<string>('geminiApiKey');
-
-    let claudeInstalled = false;
-    let claudeVersion = '';
-    let claudeAuthed = false;
-
-    const claudePath = config.get<string>('claudeCodePath') || 'claude';
-    const { execSync } = require('child_process');
-
-    // Check installed
-    try {
-      const out = execSync(`${claudePath} --version`, {
-        encoding: 'utf-8',
-        timeout: 5000,
-      }).trim();
-      claudeInstalled = true;
-      claudeVersion = out;
-    } catch {
-      claudeInstalled = false;
+  private handleAgentOutput(agentId: string, data: AgentOutput) {
+    if (data.type === 'text' || data.type === 'result') {
+      this.addEntry('claude', data.text);
+    } else if (data.type === 'error') {
+      this.addEntry('system', `✕ ${data.text}`);
     }
-
-    // Check auth (only if installed)
-    if (claudeInstalled) {
-      try {
-        const authOut = execSync(`${claudePath} auth status`, {
-          encoding: 'utf-8',
-          timeout: 5000,
-          stdio: ['pipe', 'pipe', 'pipe'],
-        }).trim();
-        // If it returns without error and contains 'authenticated' or 'Logged in', it's good
-        claudeAuthed = authOut.toLowerCase().includes('authenticated')
-          || authOut.toLowerCase().includes('logged in')
-          || authOut.toLowerCase().includes('active');
-      } catch (e: unknown) {
-        // auth status might exit non-zero if not logged in
-        // Check stderr/stdout for hints
-        const errMsg = e instanceof Error ? e.message : '';
-        claudeAuthed = errMsg.toLowerCase().includes('authenticated')
-          || errMsg.toLowerCase().includes('logged in');
-      }
-    }
-
-    this.postMessage({
-      type: 'SETUP_STATUS',
-      payload: { geminiKey, claudeInstalled, claudeVersion, claudeAuthed },
-    });
+    this.postMessage({ type: 'AGENT_OUTPUT', payload: { agentId, ...data } });
   }
 
+  // ── Setup check ────────────────────────────────────────────────────────────
 
-  private async executeCommand(prompt: string) {
-    const riskCheck = vscode.workspace
-      .getConfiguration('tara')
-      .get<boolean>('riskConfirmation', true);
+  private async runSetupCheck() {
+    const config = vscode.workspace.getConfiguration('tara');
+    const geminiKey = !!(await this.getApiKey());
+    const claudePath = config.get<string>('claudeCodePath') || 'claude';
 
-    if (riskCheck && isRiskyCommand(prompt)) {
-      this.pendingConfirmation = { prompt };
-      this.postMessage({
-        type: 'RISK_CONFIRM_REQUEST',
-        payload: {
-          message: `⚠️ This command may be destructive:\n\n"${prompt}"\n\nConfirm execution?`,
-        },
-      });
-      // Also speak the warning
-      this.voiceBridge?.speak(
-        `Warning: this command appears destructive. Please confirm before I proceed.`
+    const status: SetupStatus = {
+      geminiKey,
+      claudeInstalled: false,
+      claudeAuthed: false,
+    };
+
+    const version = await runClaude(claudePath, ['--version']);
+    if (!version.ok) {
+      this.postMessage({ type: 'SETUP_STATUS', payload: status });
+      return;
+    }
+    status.claudeInstalled = true;
+    status.claudeVersion = version.stdout.trim();
+
+    // `claude auth status` prints JSON, e.g.
+    //   {"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"max"}
+    // The previous implementation searched for the substring "logged in", which
+    // never matches `loggedIn`, so a signed-in user was reported as signed out —
+    // and the setup gate could never be satisfied.
+    const auth = await runClaude(claudePath, ['auth', 'status']);
+    const parsed = parseJsonLoose(auth.stdout) ?? parseJsonLoose(auth.stderr);
+    if (parsed && typeof parsed.loggedIn === 'boolean') {
+      status.claudeAuthed = parsed.loggedIn;
+      const method = typeof parsed.authMethod === 'string' ? parsed.authMethod : '';
+      const tier = typeof parsed.subscriptionType === 'string' ? parsed.subscriptionType : '';
+      status.claudeAuthDetail = [method, tier].filter(Boolean).join(' · ');
+    } else {
+      // Older CLIs print prose. Fall back to a conservative text check.
+      const blob = `${auth.stdout}\n${auth.stderr}`.toLowerCase();
+      status.claudeAuthed =
+        auth.ok && /\b(logged in|authenticated|active subscription)\b/.test(blob);
+    }
+
+    this.postMessage({ type: 'SETUP_STATUS', payload: status });
+  }
+
+  // ── Execution ──────────────────────────────────────────────────────────────
+
+  private shouldConfirm(text: string): boolean {
+    return (
+      vscode.workspace.getConfiguration('tara').get<boolean>('riskConfirmation', true) &&
+      isRiskyCommand(text)
+    );
+  }
+
+  /**
+   * Asks the user to confirm. `replyToAgentId` distinguishes "confirm this new
+   * task" from "confirm this answer to a waiting agent".
+   */
+  private requestConfirmation(prompt: string, replyToAgentId?: string) {
+    if (this.pendingConfirmation) {
+      // One dialog at a time; queueing silently would hide the second command.
+      this.addSystemMessage(
+        'Another command is already waiting for confirmation — answer that one first.'
       );
       return;
     }
-
-    await this.dispatchToOrchestrator(prompt);
+    this.pendingConfirmation =
+      replyToAgentId !== undefined
+        ? { prompt, replyToAgentId: replyToAgentId || '' }
+        : { prompt };
+    this.postMessage({
+      type: 'RISK_CONFIRM_REQUEST',
+      payload: { message: `This looks destructive:\n\n"${prompt}"\n\nRun it anyway?` },
+    });
+    void this.speak('That command looks destructive. Please confirm before I run it.');
   }
 
-  private async dispatchToOrchestrator(prompt: string) {
+  private async forwardReply(text: string, agentId?: string) {
+    const answered = this.orchestrator.replyToAgent(text, agentId);
+    if (!answered) {
+      this.addSystemMessage(
+        'That agent is no longer waiting — sending it as a new task instead.'
+      );
+      await this.executeCommand(text);
+    }
+  }
+
+  private async executeCommand(prompt: string) {
+    if (this.shouldConfirm(prompt)) {
+      this.requestConfirmation(prompt);
+      return;
+    }
+    this.dispatchToOrchestrator(prompt);
+  }
+
+  private dispatchToOrchestrator(prompt: string) {
     try {
-      await this.orchestrator.runTask(prompt);
-    } catch (err: unknown) {
+      this.orchestrator.runTask(prompt);
+    } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      // addSystemMessage already posts AGENT_OUTPUT to the webview; posting
+      // ERROR as well rendered the same failure twice.
       this.addSystemMessage(`Error: ${message}`);
-      this.postMessage({ type: 'ERROR', payload: { message } });
     }
   }
 
   postMessage(msg: TaraMessage) {
-    this.view?.webview.postMessage(msg);
+    void this.view?.webview.postMessage(msg);
+  }
+
+  dispose() {
+    this.disposeViewListeners();
+    this.voiceBridge?.dispose();
+    this.voiceBridge = undefined;
   }
 
   // ── HTML ───────────────────────────────────────────────────────────────────
 
   private buildHtml(webview: vscode.Webview): string {
-    const distPath = vscode.Uri.joinPath(
-      this.context.extensionUri,
-      'webview-ui',
-      'dist'
-    );
+    const distPath = vscode.Uri.joinPath(this.context.extensionUri, 'webview-ui', 'dist');
     const scriptUri = webview.asWebviewUri(
       vscode.Uri.joinPath(distPath, 'assets', 'index.js')
     );
-    // Find the actual CSS file (Vite may name it differently)
-    const cssUri = this.findCssUri(webview, distPath);
+    const cssUri = findCssUri(webview, distPath);
+    // Shipped un-hashed from `public/`, so this URI is stable. AudioWorklet
+    // module loads are checked against script-src, which allows cspSource; a
+    // nonce cannot authorize them because the fetch has no element.
+    const workletUri = webview.asWebviewUri(
+      vscode.Uri.joinPath(distPath, 'pcm16k-worklet.js')
+    );
     const nonce = getNonce();
 
     return /* html */ `<!DOCTYPE html>
@@ -357,43 +619,118 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     default-src 'none';
     style-src ${webview.cspSource} 'unsafe-inline';
     script-src 'nonce-${nonce}' ${webview.cspSource};
-    connect-src wss: https:;
-    media-src 'self' blob:;
-    font-src ${webview.cspSource} https://fonts.gstatic.com;
+    img-src ${webview.cspSource} data:;
+    media-src ${webview.cspSource} blob:;
+    font-src ${webview.cspSource};
+    connect-src ${webview.cspSource};
   "/>
   ${cssUri ? `<link rel="stylesheet" href="${cssUri}" />` : ''}
   <title>Tara</title>
 </head>
 <body>
   <div id="root"></div>
+  <script nonce="${nonce}">window.__taraWorkletUri = ${JSON.stringify(workletUri.toString())};</script>
   <script type="module" nonce="${nonce}" src="${scriptUri}"></script>
 </body>
 </html>`;
   }
+}
 
-  private findCssUri(webview: vscode.Webview, distPath: vscode.Uri): string | null {
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface CommandResult {
+  ok: boolean;
+  stdout: string;
+  stderr: string;
+}
+
+/**
+ * Runs the Claude CLI and captures its output.
+ *
+ * Goes through buildLaunchSpec because on Windows `claude` is a `.cmd` shim, and
+ * handing that straight to execFile with `shell: false` fails with EINVAL on
+ * Node 20+ — which would make the setup check report "not installed" on every
+ * Windows machine. Async so the extension host is never blocked; the previous
+ * implementation used execSync.
+ */
+function runClaude(claudePath: string, args: string[]): Promise<CommandResult> {
+  const launch = buildLaunchSpec(claudePath, args);
+  if (!launch) {
+    return Promise.resolve({ ok: false, stdout: '', stderr: 'claude not found on PATH' });
+  }
+  return new Promise((resolve) => {
+    // execFile can throw synchronously (bad path, EINVAL). Left uncaught it
+    // becomes a rejection that never resolves the setup check.
     try {
-      const assetsPath = path.join(distPath.fsPath, 'assets');
-      const files = fs.readdirSync(assetsPath);
-      const cssFile = files.find((f) => f.endsWith('.css'));
-      if (cssFile) {
-        return webview.asWebviewUri(
-          vscode.Uri.joinPath(distPath, 'assets', cssFile)
-        ).toString();
-      }
-    } catch {
-      // dist not built yet
+      execFile(
+        launch.file,
+        launch.args,
+        {
+          timeout: 10_000,
+          windowsHide: true,
+          shell: false,
+          windowsVerbatimArguments: launch.windowsVerbatimArguments,
+          encoding: 'utf-8',
+        },
+        (error, stdout, stderr) => {
+          resolve({ ok: !error, stdout: stdout ?? '', stderr: stderr ?? '' });
+        }
+      );
+    } catch (err) {
+      resolve({
+        ok: false,
+        stdout: '',
+        stderr: err instanceof Error ? err.message : String(err),
+      });
     }
-    return null;
+  });
+}
+
+/** Finds the first `{...}` in `text` and parses it, tolerating surrounding noise. */
+function parseJsonLoose(text: string): Record<string, unknown> | undefined {
+  if (!text) {
+    return undefined;
+  }
+  const start = text.indexOf('{');
+  const end = text.lastIndexOf('}');
+  if (start < 0 || end <= start) {
+    return undefined;
+  }
+  try {
+    const value: unknown = JSON.parse(text.slice(start, end + 1));
+    return value && typeof value === 'object'
+      ? (value as Record<string, unknown>)
+      : undefined;
+  } catch {
+    return undefined;
   }
 }
 
-function getNonce(): string {
+export function findCssUri(
+  webview: vscode.Webview,
+  distPath: vscode.Uri
+): string | undefined {
+  try {
+    const assetsPath = path.join(distPath.fsPath, 'assets');
+    const cssFile = fs.readdirSync(assetsPath).find((f) => f.endsWith('.css'));
+    if (cssFile) {
+      return webview
+        .asWebviewUri(vscode.Uri.joinPath(distPath, 'assets', cssFile))
+        .toString();
+    }
+  } catch {
+    // dist not built yet
+  }
+  return undefined;
+}
+
+export function getNonce(): string {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
   let text = '';
-  const possible =
-    'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
   for (let i = 0; i < 32; i++) {
-    text += possible.charAt(Math.floor(Math.random() * possible.length));
+    text += chars.charAt(Math.floor(Math.random() * chars.length));
   }
   return text;
 }

@@ -1,5 +1,6 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { postToExtension, onExtensionMessage } from './vscode-api';
+import { MicCapture, PcmPlayer } from './audio';
 import { SetupScreen } from './components/SetupScreen';
 import { VoiceOrb } from './components/VoiceOrb';
 import { ChatBubble } from './components/ChatBubble';
@@ -15,55 +16,200 @@ interface ChatEntry {
   streaming?: boolean;
 }
 
-interface AgentState {
-  status: 'idle' | 'running' | 'waiting_for_input' | 'done' | 'error';
-  activeAgents: string[];
+type AgentStatus = 'idle' | 'running' | 'waiting_for_input' | 'done' | 'error';
+
+interface PendingQuestion {
+  agentId: string;
+  title: string;
+  question: string;
 }
 
 export default function App() {
-  // ── Setup gate ──────────────────────────────────────────────────────────
-  const [setupDone, setSetupDone] = useState(false);
+  // `undefined` means "not yet told by the extension", which is different from
+  // "setup is incomplete" — rendering the gate before INIT arrives would flash
+  // the setup screen at users who finished it long ago.
+  const [setupDone, setSetupDone] = useState<boolean | undefined>(undefined);
 
-  // ── Chat state (only used after setup) ─────────────────────────────────
   const [history, setHistory] = useState<ChatEntry[]>([]);
   const [textInput, setTextInput] = useState('');
-  const [agentState, setAgentState] = useState<AgentState>({ status: 'idle', activeAgents: [] });
+  const [agentStatus, setAgentStatus] = useState<AgentStatus>('idle');
+  const [pendingQuestion, setPendingQuestion] = useState<PendingQuestion | null>(null);
   const [transcriptDraft, setTranscriptDraft] = useState('');
   const [isListening, setIsListening] = useState(false);
   const [confirmRequest, setConfirmRequest] = useState<{ message: string } | null>(null);
   const [analyserNode, setAnalyserNode] = useState<AnalyserNode | null>(null);
+  const [micDeviceId, setMicDeviceId] = useState('');
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const streamingEntryRef = useRef<string | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
+  // Keyed by agent id: with up to `tara.maxConcurrentAgents` running, a single
+  // slot merged two agents' output into one bubble.
+  const streamingByAgentRef = useRef<Map<string, string>>(new Map());
+  const captureRef = useRef<MicCapture | null>(null);
+  const playerRef = useRef<PcmPlayer | null>(null);
+  // Read inside callbacks that must not be re-created on every state change.
+  const micDeviceIdRef = useRef('');
+  const isListeningRef = useRef(false);
 
-  // ── Scroll to bottom ─────────────────────────────────────────────────────
+  micDeviceIdRef.current = micDeviceId;
+  isListeningRef.current = isListening;
+
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [history, transcriptDraft]);
 
-  // ── Extension message handler ─────────────────────────────────────────────
+  // Long-lived playback context; the capture context is per-utterance.
+  useEffect(() => {
+    playerRef.current = new PcmPlayer();
+    return () => {
+      void playerRef.current?.close();
+      playerRef.current = null;
+      void captureRef.current?.stop();
+      captureRef.current = null;
+    };
+  }, []);
+
+  // ── Chat helpers ──────────────────────────────────────────────────────────
+
+  const appendMessage = useCallback((partial: Omit<ChatEntry, 'id' | 'timestamp'>) => {
+    setHistory((h) => [
+      ...h,
+      {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        timestamp: Date.now(),
+        ...partial,
+      },
+    ]);
+  }, []);
+
+  const appendStreamingMessage = useCallback((agentId: string, text: string) => {
+    setHistory((h) => {
+      const openId = streamingByAgentRef.current.get(agentId);
+      const idx = openId ? h.findIndex((e) => e.id === openId) : -1;
+      if (idx >= 0) {
+        const updated = [...h];
+        updated[idx] = { ...updated[idx], content: updated[idx].content + text };
+        return updated;
+      }
+      const entry: ChatEntry = {
+        id: `${agentId}-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        role: 'claude',
+        content: text,
+        timestamp: Date.now(),
+        streaming: true,
+      };
+      streamingByAgentRef.current.set(agentId, entry.id);
+      return [...h, entry];
+    });
+  }, []);
+
+  /** Marks open assistant bubbles finished so the next turn starts fresh ones. */
+  const closeStreamingMessage = useCallback((agentId?: string) => {
+    const map = streamingByAgentRef.current;
+    const ids = agentId
+      ? [map.get(agentId)].filter((v): v is string => !!v)
+      : [...map.values()];
+    if (agentId) {
+      map.delete(agentId);
+    } else {
+      map.clear();
+    }
+    if (!ids.length) {
+      return;
+    }
+    const closing = new Set(ids);
+    setHistory((h) => h.map((e) => (closing.has(e.id) ? { ...e, streaming: false } : e)));
+  }, []);
+
+  // ── Voice ─────────────────────────────────────────────────────────────────
+
+  const stopCapture = useCallback(async () => {
+    setIsListening(false);
+    setAnalyserNode(null);
+    const capture = captureRef.current;
+    captureRef.current = null;
+    if (capture) {
+      await capture.stop();
+    }
+  }, []);
+
+  const handleVoiceStart = useCallback(async () => {
+    if (captureRef.current) {
+      return;
+    }
+    const capture = new MicCapture();
+    captureRef.current = capture;
+    try {
+      const { analyser } = await capture.start(micDeviceIdRef.current || undefined, {
+        onChunk: (base64) =>
+          postToExtension({ type: 'VOICE_AUDIO_CHUNK', payload: { base64 } }),
+        onError: (message) => appendMessage({ role: 'system', content: `⚠ ${message}` }),
+      });
+      setAnalyserNode(analyser);
+      setIsListening(true);
+      postToExtension({ type: 'VOICE_START', payload: {} });
+    } catch (err) {
+      captureRef.current = null;
+      await capture.stop();
+      const message = err instanceof Error ? err.message : String(err);
+      const denied = /permission|notallowed|denied/i.test(message);
+      appendMessage({
+        role: 'system',
+        content: denied
+          ? '⚠ Microphone access was blocked. Open VS Code microphone settings and allow it, then try again.'
+          : `⚠ Could not start the microphone: ${message}`,
+      });
+    }
+  }, [appendMessage]);
+
+  const handleVoiceEnd = useCallback(async () => {
+    if (!isListeningRef.current && !captureRef.current) {
+      return;
+    }
+    await stopCapture();
+    postToExtension({ type: 'VOICE_STOP', payload: {} });
+  }, [stopCapture]);
+
+  // ── Extension messages ────────────────────────────────────────────────────
+
   useEffect(() => {
     const cleanup = onExtensionMessage((msg) => {
       switch (msg.type) {
         case 'INIT': {
-          const { history: h } = msg.payload as { history: ChatEntry[] };
-          if (h?.length) setHistory(h);
+          const payload = msg.payload as {
+            history?: ChatEntry[];
+            setupComplete?: boolean;
+            micDeviceId?: string;
+            agentStatus?: AgentStatus;
+            awaitingInput?: boolean;
+          };
+          if (payload.history?.length) {
+            setHistory(payload.history);
+          }
+          setSetupDone(!!payload.setupComplete);
+          setMicDeviceId(payload.micDeviceId ?? '');
+          if (payload.agentStatus) {
+            setAgentStatus(payload.agentStatus);
+          }
+          // An agent can already be blocked on a question if the panel was
+          // reloaded mid-task. Without this the next message would be sent as a
+          // brand-new task instead of the answer it is. The empty agentId makes
+          // the extension route it to the longest-waiting agent.
+          if (payload.awaitingInput) {
+            setPendingQuestion({ agentId: '', title: '', question: '' });
+          }
           break;
         }
 
         case 'TRANSCRIPT_TOKEN': {
-          const { token } = msg.payload as { token: string };
-          setTranscriptDraft((d) => d + token);
+          const { token, partial } = msg.payload as { token: string; partial?: boolean };
+          // A partial transcript replaces the draft; final tokens accumulate.
+          setTranscriptDraft((d) => (partial ? token : d + token));
           break;
         }
 
         case 'TRANSCRIPT_DONE': {
-          const { transcript } = msg.payload as { transcript: string };
           setTranscriptDraft('');
-          appendMessage({ role: 'user', content: transcript });
+          // The extension echoes the user turn into history itself.
           break;
         }
 
@@ -76,34 +222,58 @@ export default function App() {
           if (type === 'text' || type === 'result') {
             appendStreamingMessage(agentId ?? 'claude', text);
           } else if (type === 'tool') {
-            appendMessage({ role: 'system', content: text });
+            appendMessage({ role: 'system', content: `🔧 ${text}` });
           } else if (type === 'error') {
             appendMessage({ role: 'system', content: `✕ ${text}` });
+          } else {
+            appendMessage({ role: 'system', content: text });
           }
           break;
         }
 
         case 'AGENT_STATUS': {
           const payload = msg.payload as {
-            status?: AgentState['status'];
-            activeAgents?: string[];
+            status?: AgentStatus;
+            awaitingInput?: boolean;
             action?: string;
           };
           if (payload.action === 'triggerVoice') {
-            handleVoiceStart();
+            void handleVoiceStart();
           }
           if (payload.status) {
-            setAgentState((prev) => ({
-              status: payload.status ?? prev.status,
-              activeAgents: payload.activeAgents ?? prev.activeAgents,
-            }));
+            setAgentStatus(payload.status);
+            if (payload.status !== 'running') {
+              closeStreamingMessage();
+            }
           }
+          if (payload.awaitingInput === false) {
+            setPendingQuestion(null);
+          }
+          break;
+        }
+
+        case 'AGENT_QUESTION': {
+          // The question text already arrived as AGENT_OUTPUT; adding a bubble
+          // here would show the same words a second time.
+          closeStreamingMessage();
+          setPendingQuestion(msg.payload as PendingQuestion);
           break;
         }
 
         case 'TTS_AUDIO_CHUNK': {
           const { base64 } = msg.payload as { base64: string };
-          playAudioChunk(base64);
+          playerRef.current?.enqueue(base64);
+          break;
+        }
+
+        case 'TTS_DONE':
+          break;
+
+        case 'VOICE_STATE': {
+          const { state } = msg.payload as { state: string };
+          if (state === 'error' || state === 'idle') {
+            setTranscriptDraft('');
+          }
           break;
         }
 
@@ -118,146 +288,89 @@ export default function App() {
           appendMessage({ role: 'system', content: `⚠ ${message}` });
           break;
         }
+
+        default:
+          break;
       }
     });
-    return cleanup;
-  }, []);
+    // Requested only now that the handler is registered: a postMessage sent
+    // before this script subscribes is dropped, and without INIT the panel
+    // would sit blank forever waiting to learn whether setup is done.
+    postToExtension({ type: 'WEBVIEW_READY', payload: {} });
 
-  // ── TTS audio playback ────────────────────────────────────────────────────
-  const playAudioChunk = useCallback(async (base64: string) => {
-    try {
-      if (!audioContextRef.current) {
-        audioContextRef.current = new AudioContext({ sampleRate: 24000 });
-      }
-      const ctx = audioContextRef.current;
-      const binary = atob(base64);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-      const pcm = new Int16Array(bytes.buffer);
-      const float32 = new Float32Array(pcm.length);
-      for (let i = 0; i < pcm.length; i++) float32[i] = pcm[i] / 32768;
-      const buffer = ctx.createBuffer(1, float32.length, 24000);
-      buffer.copyToChannel(float32, 0);
-      const source = ctx.createBufferSource();
-      source.buffer = buffer;
-      source.connect(ctx.destination);
-      source.start();
-    } catch (e) {
-      console.error('[Tara] TTS error', e);
-    }
-  }, []);
+    // Last resort, so a lost INIT degrades to the setup screen (which can
+    // re-check everything itself) instead of an empty panel.
+    const initFallback = setTimeout(() => {
+      setSetupDone((current) => (current === undefined ? false : current));
+    }, 2500);
 
-  // ── Chat helpers ──────────────────────────────────────────────────────────
-  function appendMessage(partial: Omit<ChatEntry, 'id' | 'timestamp'>) {
-    streamingEntryRef.current = null;
-    setHistory((h) => [
-      ...h,
-      { id: `${Date.now()}-${Math.random()}`, timestamp: Date.now(), ...partial },
-    ]);
-  }
-
-  function appendStreamingMessage(agentId: string, text: string) {
-    setHistory((h) => {
-      const idx = streamingEntryRef.current
-        ? h.findIndex((e) => e.id === streamingEntryRef.current)
-        : -1;
-      if (idx >= 0) {
-        const updated = [...h];
-        updated[idx] = { ...updated[idx], content: updated[idx].content + text };
-        return updated;
-      }
-      const entry: ChatEntry = {
-        id: `${agentId}-${Date.now()}`,
-        role: 'claude',
-        content: text,
-        timestamp: Date.now(),
-        streaming: true,
-      };
-      streamingEntryRef.current = entry.id;
-      return [...h, entry];
-    });
-  }
-
-  // ── Voice ─────────────────────────────────────────────────────────────────
-  async function handleVoiceStart() {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
-
-      const ctx = new AudioContext();
-      audioContextRef.current = ctx;
-      const source = ctx.createMediaStreamSource(stream);
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 256;
-      analyser.smoothingTimeConstant = 0.75;
-      source.connect(analyser);
-      setAnalyserNode(analyser);
-
-      const recorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
-      mediaRecorderRef.current = recorder;
-
-      recorder.ondataavailable = async (e) => {
-        if (e.data.size > 0) {
-          const buf = await e.data.arrayBuffer();
-          const base64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
-          postToExtension({ type: 'VOICE_AUDIO_CHUNK', payload: { base64 } });
-        }
-      };
-
-      recorder.start(250);
-      setIsListening(true);
-      postToExtension({ type: 'VOICE_START', payload: {} });
-    } catch (err) {
-      console.error('[Tara] Mic error:', err);
-      appendMessage({ role: 'system', content: '⚠ Microphone access denied.' });
-    }
-  }
-
-  function handleVoiceEnd() {
-    mediaRecorderRef.current?.stop();
-    streamRef.current?.getTracks().forEach((t) => t.stop());
-    streamRef.current = null;
-    mediaRecorderRef.current = null;
-    setIsListening(false);
-    setAnalyserNode(null);
-    postToExtension({ type: 'VOICE_STOP', payload: {} });
-  }
+    return () => {
+      clearTimeout(initFallback);
+      cleanup();
+    };
+  }, [appendMessage, appendStreamingMessage, closeStreamingMessage, handleVoiceStart]);
 
   // ── Text submit ───────────────────────────────────────────────────────────
+
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     const text = textInput.trim();
-    if (!text) return;
+    if (!text) {
+      return;
+    }
     setTextInput('');
     appendMessage({ role: 'user', content: text });
+
+    if (pendingQuestion) {
+      postToExtension({
+        type: 'REPLY_TO_AGENT',
+        payload: { text, agentId: pendingQuestion.agentId },
+      });
+      setPendingQuestion(null);
+      return;
+    }
     postToExtension({ type: 'SEND_COMMAND', payload: { text } });
   }
 
   function handleStop() {
     postToExtension({ type: 'STOP_AGENT', payload: {} });
-    appendMessage({ role: 'system', content: '⏹ Agent stopped.' });
+    setPendingQuestion(null);
+    appendMessage({ role: 'system', content: '⏹ Stopped.' });
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
   //  RENDER
   // ═══════════════════════════════════════════════════════════════════════════
 
-  // ── Setup gate: show setup screen until all checks pass ────────────────
-  if (!setupDone) {
-    return <SetupScreen onComplete={() => setSetupDone(true)} />;
+  if (setupDone === undefined) {
+    return <div className="tara-app" aria-busy="true" />;
   }
 
-  // ── Main chat UI ──────────────────────────────────────────────────────────
+  if (!setupDone) {
+    return (
+      <SetupScreen
+        initialMicDeviceId={micDeviceId}
+        onMicDeviceChange={setMicDeviceId}
+        onComplete={() => {
+          postToExtension({ type: 'SETUP_COMPLETE', payload: {} });
+          setSetupDone(true);
+        }}
+      />
+    );
+  }
+
+  const busy = agentStatus === 'running';
+  const canStop = busy || agentStatus === 'waiting_for_input';
+
   return (
     <div className="tara-app">
-      {/* Header */}
       <div className="tara-header">
         <div className="tara-logo">
           <span className="tara-logo-dot" />
           <span className="tara-logo-text">Tara</span>
         </div>
         <div className="tara-header-actions">
-          <StatusIndicator status={agentState.status} />
+          <StatusIndicator status={agentStatus} />
           <button
             id="tara-settings-btn"
             className="tara-settings-btn"
@@ -266,20 +379,17 @@ export default function App() {
             onClick={() => postToExtension({ type: 'OPEN_SETTINGS', payload: {} })}
           >
             <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
-              <path d="M9.1 0L8 .9l-.4 1.4a5.3 5.3 0 0 0-1.2.7L5 2.6 3.6 3.4l.4 1.4a5.5 5.5 0 0 0-.7 1.2L2 6.4v1.2l1.4.4c.2.4.4.8.7 1.2L3.7 10l.8 1.4 1.4-.4c.4.3.8.5 1.2.7l.4 1.4h1.2l.4-1.4c.4-.2.8-.4 1.2-.7l1.4.4.8-1.4-.4-1.4c.3-.4.5-.8.7-1.2l1.4-.4V6.4l-1.4-.4a5.5 5.5 0 0 0-.7-1.2l.4-1.4L11.4 2l-1.4.4A5.3 5.3 0 0 0 8.8 2L8.4 0H9.1zM8 5.5a2.5 2.5 0 1 1 0 5 2.5 2.5 0 0 1 0-5z"/>
+              <path d="M9.1 0L8 .9l-.4 1.4a5.3 5.3 0 0 0-1.2.7L5 2.6 3.6 3.4l.4 1.4a5.5 5.5 0 0 0-.7 1.2L2 6.4v1.2l1.4.4c.2.4.4.8.7 1.2L3.7 10l.8 1.4 1.4-.4c.4.3.8.5 1.2.7l.4 1.4h1.2l.4-1.4c.4-.2.8-.4 1.2-.7l1.4.4.8-1.4-.4-1.4c.3-.4.5-.8.7-1.2l1.4-.4V6.4l-1.4-.4a5.5 5.5 0 0 0-.7-1.2l.4-1.4L11.4 2l-1.4.4A5.3 5.3 0 0 0 8.8 2L8.4 0H9.1zM8 5.5a2.5 2.5 0 1 1 0 5 2.5 2.5 0 0 1 0-5z" />
             </svg>
           </button>
         </div>
       </div>
 
-      {/* Chat */}
       <div className="tara-chat">
         {history.length === 0 && (
           <div className="tara-empty">
             <span className="tara-empty-label">Ready</span>
-            <p className="tara-empty-sub">
-              Hold the orb to speak, or type a command below.
-            </p>
+            <p className="tara-empty-sub">Hold the orb to speak, or type a command below.</p>
           </div>
         )}
 
@@ -298,7 +408,6 @@ export default function App() {
         <div ref={messagesEndRef} />
       </div>
 
-      {/* Confirm dialog */}
       {confirmRequest && (
         <ConfirmDialog
           message={confirmRequest.message}
@@ -313,15 +422,13 @@ export default function App() {
         />
       )}
 
-      {/* Voice orb */}
       <VoiceOrb
         isListening={isListening}
-        onStart={handleVoiceStart}
-        onEnd={handleVoiceEnd}
+        onStart={() => void handleVoiceStart()}
+        onEnd={() => void handleVoiceEnd()}
         analyserNode={analyserNode}
       />
 
-      {/* Text input bar */}
       <div className="tara-input-bar">
         <form className="tara-text-form" onSubmit={handleSubmit}>
           <input
@@ -329,7 +436,13 @@ export default function App() {
             className="tara-text-input"
             value={textInput}
             onChange={(e) => setTextInput(e.target.value)}
-            placeholder="or type a command…"
+            placeholder={
+              pendingQuestion
+                ? 'Answer Tara…'
+                : isListening
+                  ? 'Listening…'
+                  : 'or type a command…'
+            }
             disabled={isListening}
             autoComplete="off"
           />
@@ -338,13 +451,13 @@ export default function App() {
             type="submit"
             className="tara-submit-btn"
             disabled={!textInput.trim() || isListening}
-            aria-label="Send"
+            aria-label={pendingQuestion ? 'Send answer' : 'Send'}
           >
             ↑
           </button>
         </form>
 
-        {agentState.status === 'running' && (
+        {canStop && (
           <button
             id="tara-stop-btn"
             className="tara-stop-btn"

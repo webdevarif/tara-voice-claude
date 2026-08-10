@@ -1,16 +1,25 @@
+# Deliberately does NOT ignore node_modules: `ws` is a runtime dependency loaded
+# by GeminiVoiceBridge, and vsce already prunes devDependencies when packaging.
+# A blanket node_modules ignore made `import('ws')` fail with MODULE_NOT_FOUND in
+# an installed build while working fine from the debug host.
 .vscode/**
 .vscode-test/**
-out/
-node_modules/
-webview-ui/node_modules/
-webview-ui/src/
-webview-ui/public/
-!webview-ui/dist/**
-src/
-!out/**
-.gitignore
+src/**
+webview-ui/src/**
+webview-ui/public/**
+webview-ui/node_modules/**
+webview-ui/package.json
+webview-ui/package-lock.json
+webview-ui/tsconfig*.json
+webview-ui/vite.config.ts
+webview-ui/index.html
+webview-ui/kanban.html
+webview-ui/README.md
+webview-ui/.oxlintrc.json
+webview-ui/.gitignore
+node_modules/.bin/**
 tsconfig.json
-webpack.config.js
+.gitignore
+.eslintrc*
 **/*.map
-**/*.ts
-!out/**/*.js
+*.vsix

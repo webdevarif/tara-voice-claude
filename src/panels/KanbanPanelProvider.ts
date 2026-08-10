@@ -1,27 +1,21 @@
 import * as vscode from 'vscode';
-import * as fs from 'fs';
-import * as path from 'path';
 import { AgentOrchestrator } from '../execution/AgentOrchestrator';
-import { TaraMessage, KanbanBoard } from '../types';
+import { KanbanBoard, TaraMessage } from '../types';
+import { findCssUri, getNonce } from './ChatPanelProvider';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// KanbanPanelProvider — sidebar panel showing agent task board + cost tracker
+// KanbanPanelProvider — sidebar board of agent cards plus the cost header
 // ─────────────────────────────────────────────────────────────────────────────
 export class KanbanPanelProvider implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
-  private context: vscode.ExtensionContext;
-  private orchestrator: AgentOrchestrator;
+  private disposables: vscode.Disposable[] = [];
 
-  constructor(context: vscode.ExtensionContext, orchestrator: AgentOrchestrator) {
-    this.context = context;
-    this.orchestrator = orchestrator;
-  }
+  constructor(
+    private readonly context: vscode.ExtensionContext,
+    private readonly orchestrator: AgentOrchestrator
+  ) {}
 
-  resolveWebviewView(
-    webviewView: vscode.WebviewView,
-    _context: vscode.WebviewViewResolveContext,
-    _token: vscode.CancellationToken
-  ) {
+  resolveWebviewView(webviewView: vscode.WebviewView) {
     this.view = webviewView;
 
     webviewView.webview.options = {
@@ -29,44 +23,58 @@ export class KanbanPanelProvider implements vscode.WebviewViewProvider {
       localResourceRoots: [
         vscode.Uri.joinPath(this.context.extensionUri, 'media'),
         vscode.Uri.joinPath(this.context.extensionUri, 'webview-ui', 'dist'),
-        vscode.Uri.joinPath(this.context.extensionUri, 'webview-ui'),
       ],
     };
 
     webviewView.webview.html = this.getKanbanHtml(webviewView.webview);
 
-    webviewView.webview.onDidReceiveMessage(
-      (msg: TaraMessage) => this.handleMessage(msg),
-      null,
-      this.context.subscriptions
+    // Scoped per view instance so a recreated view does not stack handlers.
+    this.dispose();
+    this.disposables.push(
+      webviewView.webview.onDidReceiveMessage((msg: TaraMessage) => this.handleMessage(msg)),
+      webviewView.onDidDispose(() => {
+        this.dispose();
+        this.view = undefined;
+      })
     );
 
-    // Send current board state on load
     this.postKanbanUpdate(this.orchestrator.getBoard());
   }
 
   postKanbanUpdate(board: KanbanBoard) {
-    this.view?.webview.postMessage({ type: 'KANBAN_UPDATE', payload: board });
+    void this.view?.webview.postMessage({ type: 'KANBAN_UPDATE', payload: board });
   }
 
   private handleMessage(msg: TaraMessage) {
+    if (msg.type === 'WEBVIEW_READY') {
+      // The eager post in resolveWebviewView can land before the webview's
+      // script subscribes, so the board is re-sent on request.
+      this.postKanbanUpdate(this.orchestrator.getBoard());
+      return;
+    }
     if (msg.type === 'STOP_AGENT') {
-      const { agentId } = msg.payload as { agentId: string };
-      this.orchestrator.stopAgent(agentId);
+      const { agentId } = msg.payload as { agentId?: string };
+      if (agentId) {
+        this.orchestrator.stopAgent(agentId);
+      } else {
+        this.orchestrator.stopAll();
+      }
     }
   }
 
+  dispose() {
+    for (const d of this.disposables) {
+      d.dispose();
+    }
+    this.disposables = [];
+  }
+
   private getKanbanHtml(webview: vscode.Webview): string {
-    const distPath = vscode.Uri.joinPath(
-      this.context.extensionUri,
-      'webview-ui',
-      'dist'
-    );
+    const distPath = vscode.Uri.joinPath(this.context.extensionUri, 'webview-ui', 'dist');
     const scriptUri = webview.asWebviewUri(
       vscode.Uri.joinPath(distPath, 'assets', 'kanban.js')
     );
-    // Dynamically find the CSS file
-    const cssUri = this.findCssUri(webview, distPath);
+    const cssUri = findCssUri(webview, distPath);
     const nonce = getNonce();
 
     return /* html */ `<!DOCTYPE html>
@@ -78,7 +86,8 @@ export class KanbanPanelProvider implements vscode.WebviewViewProvider {
     default-src 'none';
     style-src ${webview.cspSource} 'unsafe-inline';
     script-src 'nonce-${nonce}' ${webview.cspSource};
-    font-src ${webview.cspSource} https://fonts.gstatic.com;
+    img-src ${webview.cspSource} data:;
+    font-src ${webview.cspSource};
   "/>
   ${cssUri ? `<link rel="stylesheet" href="${cssUri}" />` : ''}
   <title>Tara Kanban</title>
@@ -89,30 +98,4 @@ export class KanbanPanelProvider implements vscode.WebviewViewProvider {
 </body>
 </html>`;
   }
-
-  private findCssUri(webview: vscode.Webview, distPath: vscode.Uri): string | null {
-    try {
-      const assetsPath = path.join(distPath.fsPath, 'assets');
-      const files = fs.readdirSync(assetsPath);
-      const cssFile = files.find((f) => f.endsWith('.css'));
-      if (cssFile) {
-        return webview.asWebviewUri(
-          vscode.Uri.joinPath(distPath, 'assets', cssFile)
-        ).toString();
-      }
-    } catch {
-      // dist not built yet
-    }
-    return null;
-  }
-}
-
-function getNonce(): string {
-  let text = '';
-  const chars =
-    'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  for (let i = 0; i < 32; i++) {
-    text += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return text;
 }

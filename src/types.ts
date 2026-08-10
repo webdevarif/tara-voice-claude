@@ -17,31 +17,36 @@ export interface TaraMessage {
 
 export type TaraMessageType =
   // Webview → Extension
-  | 'VOICE_AUDIO_CHUNK'      // base64-encoded PCM chunk from mic
-  | 'VOICE_START'            // user pressed push-to-talk
-  | 'VOICE_STOP'             // user released push-to-talk
-  | 'SEND_COMMAND'           // text command submitted from chat input
-  | 'STOP_AGENT'             // user clicked stop
-  | 'CONFIRM_EXECUTION'      // user confirmed risky command
-  | 'CANCEL_EXECUTION'       // user cancelled risky command
-  | 'OPEN_SETTINGS'          // user clicked settings gear
-  | 'CHECK_SETUP'            // webview requests setup status check
-  | 'SAVE_API_KEY'           // webview sends gemini API key to save
-  | 'OPEN_URL'               // webview asks extension to open a URL
+  | 'WEBVIEW_READY'           // webview has subscribed and wants its initial state
+  | 'VOICE_START'             // user pressed push-to-talk
+  | 'VOICE_STOP'              // user released push-to-talk
+  | 'VOICE_AUDIO_CHUNK'       // base64-encoded 16 kHz 16-bit mono PCM chunk
+  | 'SEND_COMMAND'            // text command submitted from chat input
+  | 'REPLY_TO_AGENT'          // answer to a clarifying question from an agent
+  | 'STOP_AGENT'              // user clicked stop
+  | 'CONFIRM_EXECUTION'       // user confirmed risky command
+  | 'CANCEL_EXECUTION'        // user cancelled risky command
+  | 'OPEN_SETTINGS'           // user clicked settings gear
+  | 'CHECK_SETUP'             // webview requests setup status check
+  | 'SAVE_API_KEY'            // webview sends gemini API key to save
+  | 'OPEN_URL'                // webview asks extension to open a URL
   | 'SET_MIC_DEVICE'          // webview tells extension which mic device to use
   | 'OPEN_MIC_SETTINGS'       // webview asks extension to open VS Code mic settings
+  | 'SETUP_COMPLETE'          // webview reports setup finished; persist it
   // Extension → Webview
-  | 'TRANSCRIPT_TOKEN'       // streaming STT token
-  | 'TRANSCRIPT_DONE'        // full transcript finalized
-  | 'AGENT_OUTPUT'           // streaming Claude output line
-  | 'AGENT_STATUS'           // agent status change
-  | 'TTS_AUDIO_CHUNK'        // base64-encoded TTS audio from Gemini
-  | 'TTS_DONE'               // TTS stream complete
-  | 'RISK_CONFIRM_REQUEST'   // risky command detected — ask user to confirm
-  | 'KANBAN_UPDATE'          // full kanban board state
-  | 'ERROR'                  // error message to display
-  | 'INIT'                   // initial state on panel load
-  | 'SETUP_STATUS'           // extension reports setup check results
+  | 'TRANSCRIPT_TOKEN'        // streaming STT token
+  | 'TRANSCRIPT_DONE'         // full transcript finalized
+  | 'AGENT_OUTPUT'            // streaming Claude output line
+  | 'AGENT_STATUS'            // aggregate agent status change
+  | 'AGENT_QUESTION'          // an agent is blocked on a clarifying question
+  | 'TTS_AUDIO_CHUNK'         // base64-encoded 24 kHz PCM TTS audio from Gemini
+  | 'TTS_DONE'                // TTS stream complete
+  | 'RISK_CONFIRM_REQUEST'    // risky command detected — ask user to confirm
+  | 'KANBAN_UPDATE'           // full kanban board state
+  | 'ERROR'                   // error message to display
+  | 'INIT'                    // initial state on panel load
+  | 'SETUP_STATUS'            // extension reports setup check results
+  | 'VOICE_STATE';            // mic/voice pipeline state for UI feedback
 
 export interface ChatEntry {
   id: string;
@@ -51,50 +56,158 @@ export interface ChatEntry {
   streaming?: boolean;
 }
 
+/**
+ * Token usage as reported by the Anthropic API. The four buckets are disjoint:
+ * `inputTokens` excludes anything served from or written to the prompt cache,
+ * so a correct cost estimate has to price all four separately.
+ */
+export interface TokenUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationTokens: number;
+  cacheReadTokens: number;
+}
+
+export function emptyUsage(): TokenUsage {
+  return {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheCreationTokens: 0,
+    cacheReadTokens: 0,
+  };
+}
+
+export function addUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
+  return {
+    inputTokens: a.inputTokens + b.inputTokens,
+    outputTokens: a.outputTokens + b.outputTokens,
+    cacheCreationTokens: a.cacheCreationTokens + b.cacheCreationTokens,
+    cacheReadTokens: a.cacheReadTokens + b.cacheReadTokens,
+  };
+}
+
+export function totalTokens(u: TokenUsage): number {
+  return (
+    u.inputTokens + u.outputTokens + u.cacheCreationTokens + u.cacheReadTokens
+  );
+}
+
 export interface KanbanCard {
   id: string;
   title: string;
   status: 'todo' | 'in_progress' | 'needs_input' | 'done' | 'error';
-  agentPid?: number;
   startedAt?: number;
   completedAt?: number;
-  inputTokens: number;
-  outputTokens: number;
-  estimatedCostUsd: number;
+  /** Question text when status is `needs_input`. */
+  question?: string;
+  usage: TokenUsage;
+  /**
+   * Cost in USD. Authoritative once the CLI reports `total_cost_usd` on its
+   * result event; before that it is a cache-aware estimate from `usage`.
+   */
+  costUsd: number;
+  /** True once `costUsd` came from the CLI rather than our own estimate. */
+  costIsReported: boolean;
+  model?: string;
 }
 
 export interface KanbanBoard {
   cards: KanbanCard[];
-  totalInputTokens: number;
-  totalOutputTokens: number;
+  totalUsage: TokenUsage;
   totalCostUsd: number;
 }
 
-// Risk patterns — commands that require confirmation before execution
+// ─────────────────────────────────────────────────────────────────────────────
+// Risk detection
+//
+// These match the *prompt*, which is a coarse signal — the real danger is in the
+// tool calls Claude ends up making, which `tara.permissionMode` governs. Keep
+// the patterns narrow: a prompt like "delete the unused import" must not prompt
+// for confirmation, or users learn to click through the dialog.
+// ─────────────────────────────────────────────────────────────────────────────
 export const RISK_PATTERNS: RegExp[] = [
-  /\bdelete\b/i,
-  /\bdrop\s+(table|database|collection)\b/i,
-  /\bforce\s+push\b/i,
-  /\brm\s+-rf\b/i,
-  /\btruncate\b/i,
-  /\bpurge\b/i,
-  /\bnuke\b/i,
-  /\bdestructive\b/i,
+  /\brm\s+-[a-z]*[rf]/i,
+  /\bgit\s+push\b[^\n]*--force|\bforce[\s-]push\b/i,
+  /\bgit\s+reset\b[^\n]*--hard/i,
+  /\bgit\s+clean\b[^\n]*-[a-z]*[fd]/i,
+  /\bdrop\s+(table|database|schema|collection|index)\b/i,
+  /\btruncate\s+table\b/i,
+  /\bdelete\s+from\b/i,
+  /\bdelete\s+(the\s+)?(repo|repository|branch|database|table|bucket|volume|cluster|namespace|production|prod)\b/i,
+  /\bdrop\s+(the\s+)?(database|db)\b/i,
+  /\b(wipe|nuke|purge|obliterate)\b/i,
+  /\bformat\s+(the\s+)?(disk|drive|volume)\b/i,
+  /\brevoke\s+(all\s+)?(keys|credentials|tokens)\b/i,
 ];
 
 export function isRiskyCommand(command: string): boolean {
   return RISK_PATTERNS.some((pattern) => pattern.test(command));
 }
 
-// Pricing constants (Claude Sonnet 3.5 as default)
-export const CLAUDE_PRICING = {
-  inputPerMToken: 3.0,   // USD per million input tokens
-  outputPerMToken: 15.0, // USD per million output tokens
+// ─────────────────────────────────────────────────────────────────────────────
+// Pricing
+//
+// USD per million tokens. Cache writes bill at 1.25x the input rate (5-minute
+// TTL) and cache reads at 0.1x, so both are derived rather than tabulated.
+// ─────────────────────────────────────────────────────────────────────────────
+export interface ModelRate {
+  input: number;
+  output: number;
+}
+
+const CACHE_WRITE_MULTIPLIER = 1.25;
+const CACHE_READ_MULTIPLIER = 0.1;
+
+/**
+ * Matched against the model id reported by the CLI, longest key first, so
+ * `claude-opus-4-8` wins over `claude-opus`.
+ */
+export const MODEL_RATES: Record<string, ModelRate> = {
+  'claude-fable-5': { input: 10, output: 50 },
+  'claude-mythos-5': { input: 10, output: 50 },
+  'claude-opus-5': { input: 5, output: 25 },
+  'claude-opus-4-8': { input: 5, output: 25 },
+  'claude-opus-4-7': { input: 5, output: 25 },
+  'claude-opus-4-6': { input: 5, output: 25 },
+  'claude-opus-4-5': { input: 5, output: 25 },
+  'claude-sonnet-5': { input: 3, output: 15 },
+  'claude-sonnet-4-6': { input: 3, output: 15 },
+  'claude-sonnet-4-5': { input: 3, output: 15 },
+  'claude-haiku-4-5': { input: 1, output: 5 },
 };
 
-export function estimateCostUsd(inputTokens: number, outputTokens: number): number {
+const DEFAULT_RATE: ModelRate = MODEL_RATES['claude-opus-5'];
+
+export function resolveRate(model?: string): ModelRate {
+  if (!model) {
+    return DEFAULT_RATE;
+  }
+  const id = model.toLowerCase();
+  let best: { key: string; rate: ModelRate } | undefined;
+  for (const [key, rate] of Object.entries(MODEL_RATES)) {
+    if (id.includes(key) && (!best || key.length > best.key.length)) {
+      best = { key, rate };
+    }
+  }
+  if (best) {
+    return best.rate;
+  }
+  // Unknown id — fall back by family so a new snapshot still costs sanely.
+  if (id.includes('haiku')) {
+    return MODEL_RATES['claude-haiku-4-5'];
+  }
+  if (id.includes('sonnet')) {
+    return MODEL_RATES['claude-sonnet-5'];
+  }
+  return DEFAULT_RATE;
+}
+
+export function estimateCostUsd(usage: TokenUsage, model?: string): number {
+  const rate = resolveRate(model);
   return (
-    (inputTokens / 1_000_000) * CLAUDE_PRICING.inputPerMToken +
-    (outputTokens / 1_000_000) * CLAUDE_PRICING.outputPerMToken
+    (usage.inputTokens / 1_000_000) * rate.input +
+    (usage.outputTokens / 1_000_000) * rate.output +
+    (usage.cacheCreationTokens / 1_000_000) * rate.input * CACHE_WRITE_MULTIPLIER +
+    (usage.cacheReadTokens / 1_000_000) * rate.input * CACHE_READ_MULTIPLIER
   );
 }

@@ -3,7 +3,10 @@
    Solid colors · Grain texture · Globe orb · No gradients
    ═══════════════════════════════════════════════════════════════════════════ */
 
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+/* Remote webfonts are intentionally not imported here: the webview CSP would
+   have to allow fonts.googleapis.com as a style source, and the panel would
+   block on a network round-trip every time it loads. The token stacks below
+   lead with VS Code's own UI font so Tara matches the editor. */
 
 /* ═══════════════════════════════════════════════════════════════════════════
    Setup / Onboarding Screen
@@ -393,6 +396,13 @@
   --red:    #e05252;
   --blue:   #4a90d9;
 
+  /* Status aliases consumed by StatusIndicator */
+  --status-idle:    var(--text-3);
+  --status-running: var(--accent-hi);
+  --status-waiting: var(--amber);
+  --status-done:    var(--green);
+  --status-error:   var(--red);
+
   /* Bubble role colors */
   --bubble-user-bg:     #161828;
   --bubble-user-border: #5b5fc7;
@@ -417,8 +427,8 @@
   --r-full: 9999px;
 
   /* Type */
-  --font: 'Inter', -apple-system, system-ui, sans-serif;
-  --mono: 'JetBrains Mono', 'Cascadia Code', monospace;
+  --font: var(--vscode-font-family, 'Inter'), -apple-system, system-ui, sans-serif;
+  --mono: var(--vscode-editor-font-family, 'JetBrains Mono'), 'Cascadia Code', ui-monospace, monospace;
   --text-xs:   10px;
   --text-sm:   11px;
   --text-base: 12px;
@@ -1187,7 +1197,22 @@ body::before {
 
 .kanban-stop-btn:hover { background: rgba(224,82,82,0.12); color: var(--red); }
 
-.kanban-card-meta { display: flex; align-items: center; gap: 4px; }
+.kanban-card-meta { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+
+/* The clarifying question shown on a card parked in "Needs Input". */
+.kanban-card-question {
+  font-size: var(--text-sm);
+  line-height: 1.45;
+  color: var(--text-2);
+  background: var(--bg-base);
+  border-left: 2px solid var(--amber);
+  border-radius: var(--r-sm);
+  padding: var(--sp-2);
+  margin: var(--sp-1) 0;
+  max-height: 96px;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+}
 
 .kanban-meta-chip {
   font-size: 9px;

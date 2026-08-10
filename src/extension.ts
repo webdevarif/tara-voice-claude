@@ -21,6 +21,7 @@ export function activate(context: vscode.ExtensionContext) {
   });
 
   context.subscriptions.push(
+    { dispose: () => chatProvider.dispose() },
     vscode.window.registerWebviewViewProvider('tara.chatView', chatProvider, {
       webviewOptions: { retainContextWhenHidden: true },
     }),
@@ -49,8 +50,8 @@ export function activate(context: vscode.ExtensionContext) {
   );
 
   // ── Context Keys ──────────────────────────────────────────────────────────
-  orchestrator.onStatusChange((hasRunning) => {
-    vscode.commands.executeCommand('setContext', 'tara.agentRunning', hasRunning);
+  orchestrator.onStatusChange((_status, hasActive) => {
+    void vscode.commands.executeCommand('setContext', 'tara.agentRunning', hasActive);
   });
 
   vscode.commands.executeCommand('setContext', 'tara.chatViewFocused', false);
