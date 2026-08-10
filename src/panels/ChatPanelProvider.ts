@@ -7,7 +7,13 @@ import {
   AgentOutput,
   buildLaunchSpec,
 } from '../execution/AgentOrchestrator';
-import { GeminiVoiceBridge, VoiceState } from '../voice/GeminiVoiceBridge';
+import {
+  GEMINI_OUTPUT_SAMPLE_RATE,
+  GeminiVoiceBridge,
+  LiveToolCall,
+  RUN_TASK_TOOL,
+  VoiceState,
+} from '../voice/GeminiVoiceBridge';
 import {
   AudioInputDevice,
   CaptureBackend,
@@ -24,8 +30,10 @@ import {
   probeSpeakers,
 } from '../voice/SpeakerPlayer';
 import {
+  LanguageOption,
   LiveModelOption,
   PREBUILT_VOICES,
+  SPOKEN_LANGUAGES,
   VoiceOption,
   listLiveModels,
 } from '../voice/GeminiCatalog';
@@ -46,6 +54,9 @@ const STATE_KEY_VERIFIED = 'tara.geminiKeyVerified';
 
 /** Keeps the retained webview from growing without bound over a long session. */
 const MAX_HISTORY_ENTRIES = 400;
+
+/** Gemini returns 24 kHz signed 16-bit mono, so one second is 48000 bytes. */
+const OUTPUT_BYTES_PER_SECOND = GEMINI_OUTPUT_SAMPLE_RATE * 2;
 
 interface SetupStatus {
   /** True only for a key that is stored *and* verified against the API. */
@@ -88,6 +99,9 @@ interface SetupStatus {
   liveModel: string;
   /** Empty when the key is missing or the listing failed — not "no models". */
   liveModelOptions: LiveModelOption[];
+  /** Current `tara.language` — a code from languageOptions, or 'auto'. */
+  language: string;
+  languageOptions: LanguageOption[];
   speakResponses: boolean;
 }
 
@@ -307,7 +321,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
    * would keep using the old ones until it happened to be replaced.
    */
   private async updateVoiceSetting(
-    key: 'voiceName' | 'geminiLiveModel' | 'speakResponses',
+    key: 'voiceName' | 'geminiLiveModel' | 'speakResponses' | 'language',
     value: string | boolean | undefined
   ) {
     if (value === undefined || value === '') {
@@ -316,6 +330,10 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     await vscode.workspace
       .getConfiguration('tara')
       .update(key, value, vscode.ConfigurationTarget.Global);
+    // The language lives in the system instruction, which is part of the same
+    // one-shot setup frame as the voice and the model — so it needs the same
+    // teardown. Changing it on a live socket would do nothing until that socket
+    // happened to be replaced.
     if (key !== 'speakResponses') {
       this.voiceBridge?.dispose();
       this.voiceBridge = undefined;
@@ -366,7 +384,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
 
   private voiceDisabled(): boolean {
     return (
-      vscode.workspace.getConfiguration('tara').get<string>('voiceMode', 'push-to-talk') ===
+      vscode.workspace.getConfiguration('tara').get<string>('voiceMode', 'hands-free') ===
       'disabled'
     );
   }
@@ -374,7 +392,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   triggerVoiceStart() {
     if (this.voiceDisabled()) {
       void vscode.window.showInformationMessage(
-        'Tara: voice input is disabled. Set "tara.voiceMode" to "push-to-talk" to enable it.'
+        'Tara: voice input is disabled. Set "tara.voiceMode" to "hands-free" to enable it.'
       );
       return;
     }
@@ -400,6 +418,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       apiKey,
       model: config.get<string>('geminiLiveModel', ''),
       voiceName: config.get<string>('voiceName', 'Aoede'),
+      language: config.get<string>('language', 'auto'),
     });
 
     bridge.on('state', (state: VoiceState) => {
@@ -415,24 +434,67 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       this.postMessage({ type: 'TRANSCRIPT_TOKEN', payload: { token: text } });
     });
     bridge.on('transcriptDone', (transcript: string) => {
-      // Routed rather than dispatched: while asleep a transcript is only a wake
-      // check, and must not reach an agent.
+      // Recorded, not dispatched. Dispatch is `toolCall`'s job now — see
+      // handleToolCall. While asleep this is only ever a wake check.
       void this.handleTranscript(transcript);
     });
+    bridge.on('spokenText', (text: string) => {
+      // What Tara herself said. Accumulated rather than posted per fragment, so
+      // the transcript gets one bubble per utterance instead of a dozen. Capped,
+      // because a turn whose `turnComplete` never arrives would otherwise grow
+      // this string for as long as the session lasts.
+      if (this.taraSpeech.length < 8000) {
+        this.taraSpeech += text;
+      }
+    });
+    bridge.on('toolCall', (call: LiveToolCall, epoch: number) => {
+      this.handleToolCall(bridge, call, epoch);
+    });
+    bridge.on('toolCancel', (ids: string[]) => {
+      for (const id of ids) {
+        const agentId = this.agentByToolCall.get(id);
+        if (agentId) {
+          this.orchestrator.stopAgent(agentId);
+          this.agentByToolCall.delete(id);
+          this.toolCallByAgent.delete(agentId);
+        }
+      }
+    });
     bridge.on('ttsChunk', (base64: string) => {
+      const pcm = Buffer.from(base64, 'base64');
+      // While asleep every burst near the mic still reaches Gemini, and Gemini
+      // still answers it — that is unavoidable, the API always answers a turn.
+      // What is avoidable is playing that answer to a room Tara was not
+      // addressed in.
+      if (this.wakeProbe) {
+        return;
+      }
+      // Counted before playing, and for both playback paths, so the echo gate
+      // knows how long the room will be loud regardless of who is speaking.
+      this.holdOutput(pcm.length);
       // Played here when the bundled output module is available, so the user can
       // choose a named device. The webview's PcmPlayer is the fallback for
       // platforms without a prebuilt binary.
       if (this.speaker.available) {
-        this.speaker.enqueue(Buffer.from(base64, 'base64'));
+        this.speaker.enqueue(pcm);
       } else {
         this.postMessage({ type: 'TTS_AUDIO_CHUNK', payload: { base64 } });
       }
+    });
+    bridge.on('interrupted', () => {
+      // The server threw away the rest of its generation, so what is still
+      // queued here is the tail of a sentence it has abandoned. Playing it out
+      // is the "half a reply, then nothing" symptom; drop it instead.
+      this.speaker.reset();
+      this.outputBusyUntil = 0;
+      this.flushTaraSpeech();
+      this.postMessage({ type: 'TTS_DONE', payload: {} });
     });
     bridge.on('ttsDone', () => {
       // Releases anything still under the prebuffer threshold; a reply shorter
       // than 250 ms would otherwise sit in the queue and never play.
       this.speaker.endOfStream();
+      this.flushTaraSpeech();
       this.postMessage({ type: 'TTS_DONE', payload: {} });
     });
     bridge.on('error', (message: string) => {
@@ -572,6 +634,160 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   private preroll: Buffer[] = [];
   private prerollBytes = 0;
 
+  // ── Echo gate ──────────────────────────────────────────────────────────────
+  //
+  // Hands-free listening plus a loudspeaker in the same room is a feedback loop,
+  // and it was the loudest of the bugs behind "choppy, sometimes nothing". Tara
+  // starts speaking, the microphone hears her, the local VAD calls it speech, a
+  // new turn opens — and on the old code that also flipped the playback flag, so
+  // her own sentence was cut off mid-word. Her words were then transcribed and
+  // dispatched as if the user had said them.
+  //
+  // The fix is to know when the room is loud with our own audio. Every byte of
+  // model audio is 1/48000 of a second (24 kHz, 16-bit mono), so the moment
+  // playback will finish is arithmetic — no need to ask the device, and it works
+  // for the webview fallback path too, which cannot be asked at all.
+
+  /** Wall-clock ms until our own audio should have stopped playing. */
+  private outputBusyUntil = 0;
+  /**
+   * Extra quiet time after playback. Covers the device's own buffering and the
+   * tail of a room's reverb, both of which outlast the last sample.
+   */
+  private static readonly ECHO_TAIL_MS = 400;
+
+  private holdOutput(bytes: number) {
+    const ms = (bytes / (OUTPUT_BYTES_PER_SECOND / 1000)) | 0;
+    const from = Math.max(Date.now(), this.outputBusyUntil);
+    this.outputBusyUntil = from + ms;
+  }
+
+  private get outputBusy(): boolean {
+    return Date.now() < this.outputBusyUntil + ChatPanelProvider.ECHO_TAIL_MS;
+  }
+
+  // ── Tool calls ─────────────────────────────────────────────────────────────
+
+  /** What Tara has said in the current turn, for one bubble per utterance. */
+  private taraSpeech = '';
+  /** Live tool calls waiting on an agent, both ways, so either end can find the other. */
+  private readonly toolCallByAgent = new Map<
+    string,
+    { id: string; name: string; epoch: number }
+  >();
+  private readonly agentByToolCall = new Map<string, string>();
+
+  private flushTaraSpeech() {
+    const text = this.taraSpeech.trim();
+    this.taraSpeech = '';
+    if (!text) {
+      return;
+    }
+    this.addEntry('tara', text);
+    this.postMessage({ type: 'AGENT_OUTPUT', payload: { type: 'tara', text } });
+  }
+
+  /**
+   * The model has decided the user wants work done. This is the dispatch point,
+   * and it fires while the model is still talking — which is the whole latency
+   * win over the old design, where dispatch waited for a transcript that only
+   * finalized once a discarded spoken answer had finished generating.
+   */
+  private handleToolCall(bridge: GeminiVoiceBridge, call: LiveToolCall, epoch: number) {
+    if (call.name !== RUN_TASK_TOOL) {
+      bridge.sendToolResponse(
+        { id: call.id, name: call.name, epoch },
+        { error: `Unknown tool "${call.name}".` },
+        'SILENT'
+      );
+      return;
+    }
+
+    const task = typeof call.args.task === 'string' ? call.args.task.trim() : '';
+    if (!task) {
+      bridge.sendToolResponse(
+        { id: call.id, name: call.name, epoch },
+        { error: 'No task was given. Ask the user what they want done.' }
+      );
+      return;
+    }
+
+    // Overheard speech must never reach an agent. The model does not know it is
+    // being ignored, so it is told, rather than left waiting for a response.
+    if (this.wakeProbe) {
+      bridge.sendToolResponse(
+        { id: call.id, name: call.name, epoch },
+        { error: 'Tara is asleep and was not addressed. Nothing was run.' },
+        'SILENT'
+      );
+      return;
+    }
+
+    if (this.shouldConfirm(task)) {
+      bridge.sendToolResponse(
+        { id: call.id, name: call.name, epoch },
+        {
+          status: 'awaiting_confirmation',
+          detail: 'That looks destructive, so the user has been asked to confirm it.',
+        }
+      );
+      this.requestConfirmation(task);
+      return;
+    }
+
+    let agentId: string;
+    try {
+      agentId = this.orchestrator.runTask(task);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.addSystemMessage(message);
+      bridge.sendToolResponse({ id: call.id, name: call.name, epoch }, { error: message });
+      return;
+    }
+
+    this.toolCallByAgent.set(agentId, { id: call.id, name: call.name, epoch });
+    this.agentByToolCall.set(call.id, agentId);
+    // Shown because the model paraphrases: the user should be able to see what
+    // was actually asked of Claude, not just what they said.
+    this.addSystemMessage(`→ Claude: ${task}`);
+  }
+
+  /**
+   * Hands an agent's outcome back to the conversation. Through the tool response
+   * when the model asked for it — so Tara reads it out in the user's language,
+   * inside the same turn-taking — and by speaking it directly when the task came
+   * from the text box, where there is no call to answer.
+   */
+  private deliverAgentResult(agentId: string, text: string, failed: boolean) {
+    const call = this.toolCallByAgent.get(agentId);
+    if (!call) {
+      void this.speak(text);
+      return;
+    }
+    this.toolCallByAgent.delete(agentId);
+    this.agentByToolCall.delete(call.id);
+
+    const summary = ChatPanelProvider.toSpeech(text);
+    // With `speakResponses` off the model must still *learn* the outcome — a
+    // follow-up like "did that work?" depends on it being in the conversation —
+    // but it should not announce it. That is exactly what SILENT is for.
+    const scheduling = vscode.workspace
+      .getConfiguration('tara')
+      .get<boolean>('speakResponses', true)
+      ? 'INTERRUPT'
+      : 'SILENT';
+    const delivered = this.voiceBridge?.sendToolResponse(
+      call,
+      failed ? { error: summary } : { result: summary },
+      scheduling
+    );
+    if (!delivered) {
+      // The session that asked is gone, so its call id means nothing now. Say it
+      // as a fresh utterance rather than dropping the answer on the floor.
+      void this.speak(text);
+    }
+  }
+
   private micState(): 'off' | 'listening' | 'hearing' | 'asleep' {
     if (!this.micEnabled) {
       return 'off';
@@ -645,6 +861,24 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   /** Every captured chunk passes through here, whether or not it is sent on. */
   private handleAudioChunk(chunk: Buffer) {
     if (!this.micEnabled) {
+      return;
+    }
+    // Tara is talking. Everything the microphone hears right now is her, so it
+    // must not reach the gate — and must not reach the noise floor either, which
+    // is why the gate is reset rather than merely skipped: a floor learned from
+    // her own voice would sit far too high for the user's next sentence.
+    if (this.outputBusy) {
+      if (this.vad.isSpeaking) {
+        this.vad.reset();
+      }
+      // A turn left open here would never be closed by us — the gate swallows the
+      // frames that would have produced speechEnd — and would sit waiting on the
+      // server's own silence timer instead.
+      if (this.streaming) {
+        void this.endTurn();
+      }
+      this.preroll = [];
+      this.prerollBytes = 0;
       return;
     }
     if (this.streaming) {
@@ -778,7 +1012,11 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       return;
     }
     this.postMessage({ type: 'TRANSCRIPT_DONE', payload: { transcript: text } });
-    await this.submitUserText(text);
+    // Recorded only. The model is in the conversation now, and it dispatches to
+    // Claude by calling run_coding_task — see handleToolCall. Sending the
+    // transcript on from here as well would run every request twice: once
+    // because the model asked for it, once because we did.
+    this.addEntry('user', text);
   }
 
   // ── Message handling ───────────────────────────────────────────────────────
@@ -923,6 +1161,12 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         break;
       }
 
+      case 'SET_LANGUAGE': {
+        const { language } = msg.payload as { language?: string };
+        await this.updateVoiceSetting('language', language);
+        break;
+      }
+
       case 'SET_SPEAK_RESPONSES': {
         const { enabled } = msg.payload as { enabled?: boolean };
         await this.updateVoiceSetting('speakResponses', !!enabled);
@@ -1046,11 +1290,12 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     }
     this.postMessage({ type: 'AGENT_OUTPUT', payload: { agentId, ...data } });
 
-    // Only the final result is spoken. `text` events stream in fragments, so
-    // speaking those would talk over itself; and this is the one line the user
-    // is actually waiting to hear. Questions and warnings speak elsewhere.
-    if (data.type === 'result' && data.text.trim()) {
-      void this.speak(data.text);
+    // Only a terminal outcome is announced. `text` events stream in fragments, so
+    // announcing those would talk over itself; this is the one line the user is
+    // actually waiting to hear. An error is announced too — silence after a
+    // failed task is indistinguishable from a task still running.
+    if ((data.type === 'result' || data.type === 'error') && data.text.trim()) {
+      this.deliverAgentResult(agentId, data.text, data.type === 'error');
     }
   }
 
@@ -1108,6 +1353,8 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       voiceOptions: PREBUILT_VOICES,
       liveModel: this.liveModel(),
       liveModelOptions: [],
+      language: config.get<string>('language') || 'auto',
+      languageOptions: SPOKEN_LANGUAGES,
       speakResponses: config.get<boolean>('speakResponses', true),
     };
 

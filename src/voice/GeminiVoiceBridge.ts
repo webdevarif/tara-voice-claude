@@ -1,31 +1,51 @@
 import { EventEmitter } from 'events';
+import { buildSystemInstruction } from './GeminiCatalog';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GeminiVoiceBridge — raw WebSocket client for the Gemini Live API
 //
+// This is a *speech-to-speech* session, not a transcriber bolted to a speech
+// synthesiser. Audio goes up, audio comes straight back down, and the coding
+// work reaches Claude Code through a function call the model makes mid-turn.
+//
+// It did not start that way, and why it changed is worth recording, because the
+// old shape looked reasonable and was quietly expensive:
+//
+//   Before: audio → Gemini (used only for `inputTranscription`) → Claude Code
+//           → Gemini again (used only to read the answer out) → speaker.
+//
+//   The Live API has no transcribe-only mode; it always answers a turn. So every
+//   command made the model generate a full spoken reply that was then thrown
+//   away — billed as audio output and, worse, *waited for*: the transcript was
+//   finalized on `turnComplete`, which is the end of that discarded answer. The
+//   published reference for BidiGenerateContentTranscription lists a single
+//   field, `text`, so the `finished` flag the old code also tested for does not
+//   exist and never fired. Dispatch to Claude therefore always paid for a
+//   generation nobody heard. Reading the answer back out then cost a second
+//   round trip and a second generation.
+//
+//   Now: audio → Gemini → it speaks, and calls `run_coding_task` when the user
+//   is asking for work. Claude's answer returns as a tool response, which the
+//   model reads out in the user's own language. One leg instead of three.
+//
 // Wire protocol (ProtoJSON, camelCase — the server always answers in camelCase):
 //
 //   client → server, exactly ONE top-level key per frame:
-//     { setup: { model, generationConfig, inputAudioTranscription, ... } }
+//     { setup: { model, generationConfig, tools, systemInstruction, ... } }
 //     { realtimeInput: { audio: { data: <base64>, mimeType: "audio/pcm;rate=16000" } } }
 //     { realtimeInput: { audioStreamEnd: true } }
 //     { realtimeInput: { text: "..." } }
+//     { toolResponse: { functionResponses: [{ id, name, response }] } }
 //
 //   server → client, `usageMetadata` plus exactly one of:
 //     setupComplete | serverContent | toolCall | toolCallCancellation
 //     | goAway | sessionResumptionUpdate
 //
-// Two constraints shape the design:
-//
-//  1. `responseModalities` accepts exactly one value. TEXT and AUDIO together is
-//     a config error. We therefore run the session in AUDIO and read text from
-//     `inputAudioTranscription` / `outputAudioTranscription`, which are separate
-//     from modalities and coexist with AUDIO.
-//
-//  2. The Live API always *answers* a user turn — there is no transcribe-only
-//     mode. For push-to-talk we only want the transcript (Claude Code does the
-//     actual work), so `mode` gates playback: in 'capture' the model's audio is
-//     discarded, and in 'speak' (a turn we started with text) it is forwarded.
+// One constraint still shapes the setup frame: `responseModalities` accepts
+// exactly one value, so TEXT and AUDIO together is a config error. The session
+// runs in AUDIO, and the on-screen text comes from `inputAudioTranscription` and
+// `outputAudioTranscription`, which are siblings of generationConfig rather than
+// modalities and so coexist with AUDIO.
 // ─────────────────────────────────────────────────────────────────────────────
 
 type WsLike = {
@@ -51,8 +71,21 @@ export interface GeminiVoiceOptions {
   apiKey: string;
   model?: string;
   voiceName?: string;
-  /** Sample rate of the PCM we send. The capture worklet produces 16 kHz. */
+  /**
+   * Which language Tara understands and speaks: a code from SPOKEN_LANGUAGES, or
+   * 'auto'. Applied through the system instruction — see buildSystemInstruction
+   * for why it cannot be a config field.
+   */
+  language?: string;
+  /** Sample rate of the PCM we send. The recorder produces 16 kHz. */
   inputSampleRate?: number;
+}
+
+/** One in-flight request from the model to run something on our side. */
+export interface LiveToolCall {
+  id: string;
+  name: string;
+  args: Record<string, unknown>;
 }
 
 const WS_OPEN = 1;
@@ -60,12 +93,42 @@ const WS_OPEN = 1;
 /** Audio the server returns is always 24 kHz signed 16-bit LE mono. */
 export const GEMINI_OUTPUT_SAMPLE_RATE = 24000;
 
-const SYSTEM_INSTRUCTION =
-  'You are Tara, a voice front-end for a coding assistant inside VS Code. ' +
-  'The user speaks commands about their codebase; another agent carries them out. ' +
-  'Never attempt the coding work yourself and never restate the request back. ' +
-  'When you are given text to read out, read exactly that text and nothing else. ' +
-  'Otherwise reply with at most three words.';
+/** The one tool the model has. Claude Code is what actually touches the repo. */
+export const RUN_TASK_TOOL = 'run_coding_task';
+
+/**
+ * `NON_BLOCKING` is the whole reason this design works. A coding task runs for
+ * anything between seconds and minutes, and a blocking call would freeze the
+ * conversation for its duration — the user could not even ask what was
+ * happening. Non-blocking lets the model keep talking, and the answer is
+ * delivered late with `scheduling: 'INTERRUPT'`, so it is announced on arrival
+ * instead of waiting for the user to speak again first.
+ */
+const TOOL_DECLARATION = {
+  functionDeclarations: [
+    {
+      name: RUN_TASK_TOOL,
+      behavior: 'NON_BLOCKING',
+      description:
+        'Hand a task to Claude Code, a coding agent with read and write access to ' +
+        'the files in the open project. Use this for anything involving the real ' +
+        'code: reading it, changing it, fixing it, running it, reviewing it, or ' +
+        'explaining a specific file or function.',
+      parameters: {
+        type: 'OBJECT',
+        properties: {
+          task: {
+            type: 'STRING',
+            description:
+              'The task, in English, as one clear self-contained instruction, ' +
+              'including every detail the user gave and nothing they did not.',
+          },
+        },
+        required: ['task'],
+      },
+    },
+  ],
+};
 
 export class GeminiVoiceBridge extends EventEmitter {
   private ws?: WsLike;
@@ -73,18 +136,24 @@ export class GeminiVoiceBridge extends EventEmitter {
   private readonly apiKey: string;
   private readonly model: string;
   private readonly voiceName: string;
+  private readonly language: string;
   private readonly inputSampleRate: number;
 
   /** Frames written before `setupComplete` arrives, replayed in order after. */
   private pending: string[] = [];
   private setupDone = false;
-  /** 'capture' discards model audio; 'speak' forwards it. */
-  private mode: 'capture' | 'speak' = 'capture';
   /**
-   * Whether the user is currently holding push-to-talk. Tracked separately from
-   * `state`, because server frames (turnComplete) also drive `state` — gating the
-   * mic release on `state === 'listening'` meant a frame arriving mid-utterance
-   * could swallow the audioStreamEnd and leave the turn unfinalized.
+   * Bumped on every completed handshake. A tool call belongs to the session that
+   * asked for it: after a reconnect its id means nothing to the server, so a
+   * caller holding a stale one must be told to fall back to plain speech rather
+   * than posting a response that will be discarded in silence.
+   */
+  private epoch = 0;
+  /**
+   * Whether a turn is open and audio is being streamed. Tracked separately from
+   * `state`, because server frames also drive `state` — gating the release on
+   * `state === 'listening'` meant a frame arriving mid-utterance could swallow
+   * the audioStreamEnd and leave the turn unfinalized.
    */
   private turnActive = false;
   private transcript = '';
@@ -99,7 +168,8 @@ export class GeminiVoiceBridge extends EventEmitter {
 
   /**
    * `gemini-2.0-flash-live-001` and `gemini-live-2.5-flash-preview` were both
-   * shut down on 2025-12-09; this is their replacement.
+   * shut down on 2025-12-09; this is their replacement, and it is a native-audio
+   * model, which is what makes the speech-to-speech path above possible.
    */
   private static readonly DEFAULT_MODEL = 'gemini-3.1-flash-live-preview';
 
@@ -108,11 +178,17 @@ export class GeminiVoiceBridge extends EventEmitter {
     this.apiKey = opts.apiKey;
     this.model = opts.model?.trim() || GeminiVoiceBridge.DEFAULT_MODEL;
     this.voiceName = opts.voiceName?.trim() || 'Aoede';
+    this.language = opts.language?.trim() || 'auto';
     this.inputSampleRate = opts.inputSampleRate ?? 16000;
   }
 
   getState(): VoiceState {
     return this.state;
+  }
+
+  /** Which session is current. Compare against a value captured earlier. */
+  get sessionEpoch(): number {
+    return this.epoch;
   }
 
   private setState(state: VoiceState) {
@@ -237,7 +313,7 @@ export class GeminiVoiceBridge extends EventEmitter {
         this.setState('idle');
         this.emit('closed', code);
         // 1000 is a clean close we asked for; anything else is worth retrying,
-        // including the 15-minute audio session cap.
+        // including the audio session cap.
         if (code !== 1000) {
           this.scheduleReconnect();
         }
@@ -257,13 +333,22 @@ export class GeminiVoiceBridge extends EventEmitter {
             voiceConfig: {
               prebuiltVoiceConfig: { voiceName: this.voiceName },
             },
+            // Deliberately no `languageCode`. The Live guide states that native
+            // audio output models "automatically choose the appropriate language
+            // and don't support explicitly setting the language code", so
+            // sending one risks failing setup on exactly the models this design
+            // depends on. Language is steered from the system instruction, which
+            // every family honours.
           },
         },
+        tools: [TOOL_DECLARATION],
         // Siblings of generationConfig, not children of it. Empty object is the
         // entire payload — AudioTranscriptionConfig has no fields.
         inputAudioTranscription: {},
         outputAudioTranscription: {},
-        systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTION }] },
+        systemInstruction: {
+          parts: [{ text: buildSystemInstruction(this.language) }],
+        },
       },
     };
   }
@@ -297,7 +382,7 @@ export class GeminiVoiceBridge extends EventEmitter {
       this.ws.send(json);
       return;
     }
-    // Bounded, so a long hold on the mic while disconnected can't grow forever.
+    // Bounded, so a long utterance while disconnected cannot grow forever.
     this.pending.push(json);
     if (this.pending.length > 200) {
       this.pending.shift();
@@ -316,14 +401,13 @@ export class GeminiVoiceBridge extends EventEmitter {
   }
 
   /**
-   * Begin a push-to-talk turn. Model audio is suppressed until `speak()`.
+   * Open a turn and start streaming audio.
    *
-   * Connects first: a session that died since the last utterance (the 15-minute
-   * audio cap, a network blip) would otherwise queue the whole turn into
+   * Connects first: a session that died since the last utterance (the audio
+   * session cap, a network blip) would otherwise queue the whole turn into
    * `pending` and drop it, with the user seeing nothing but silence.
    */
   async startListening(): Promise<void> {
-    this.mode = 'capture';
     this.transcript = '';
     this.turnActive = true;
     this.setState('listening');
@@ -339,7 +423,7 @@ export class GeminiVoiceBridge extends EventEmitter {
     }
   }
 
-  /** Push-to-talk released — ask the server to finalize immediately. */
+  /** Local speech gate closed — ask the server to finalize immediately. */
   stopListening() {
     if (!this.turnActive) {
       return;
@@ -347,7 +431,7 @@ export class GeminiVoiceBridge extends EventEmitter {
     this.turnActive = false;
     this.setState('processing');
     // Hybrid VAD: server-side VAD stays on, but this short-circuits its silence
-    // timer so the transcript finalizes as soon as the user lets go.
+    // timer so the turn finalizes as soon as the user stops talking.
     this.send({ realtimeInput: { audioStreamEnd: true } });
     this.emit('listeningStop');
   }
@@ -368,8 +452,12 @@ export class GeminiVoiceBridge extends EventEmitter {
   }
 
   /**
-   * Speak `text` aloud. Uses `realtimeInput.text` rather than `clientContent`:
-   * on gemini-3.1-flash-live-preview `clientContent` is only for seeding initial
+   * Put `text` into the conversation as if the user had said it — for the things
+   * that originate on our side rather than at the microphone: a typed command, a
+   * warning, a question from an agent.
+   *
+   * Uses `realtimeInput.text` rather than `clientContent`: on
+   * gemini-3.1-flash-live-preview `clientContent` is only for seeding initial
    * history and needs `historyConfig.initialHistoryInClientContent`.
    */
   async speak(text: string): Promise<void> {
@@ -378,9 +466,39 @@ export class GeminiVoiceBridge extends EventEmitter {
       return;
     }
     await this.connect();
-    this.mode = 'speak';
     this.setState('speaking');
     this.send({ realtimeInput: { text: trimmed } });
+  }
+
+  /**
+   * Answer a `toolCall`. `scheduling` decides how the model surfaces it:
+   * 'INTERRUPT' to announce it now, 'WHEN_IDLE' to wait for a gap, 'SILENT' to
+   * absorb it without speaking.
+   *
+   * Returns false when the session that made the call is gone — the id would
+   * mean nothing to the new one, so the caller should speak the result instead.
+   */
+  sendToolResponse(
+    call: { id: string; name: string; epoch: number },
+    result: Record<string, unknown>,
+    scheduling: 'INTERRUPT' | 'WHEN_IDLE' | 'SILENT' = 'INTERRUPT'
+  ): boolean {
+    if (call.epoch !== this.epoch || !this.setupDone) {
+      return false;
+    }
+    this.send({
+      toolResponse: {
+        functionResponses: [
+          {
+            id: call.id,
+            name: call.name,
+            // `scheduling` rides inside `response`, alongside the payload.
+            response: { ...result, scheduling },
+          },
+        ],
+      },
+    });
+    return true;
   }
 
   // ── Inbound ────────────────────────────────────────────────────────────────
@@ -396,6 +514,7 @@ export class GeminiVoiceBridge extends EventEmitter {
     if ('setupComplete' in msg) {
       // Documented as having no fields — test for presence, not truthiness.
       this.setupDone = true;
+      this.epoch += 1;
       this.reconnectAttempts = 0;
       this.setState('ready');
       this.flushPending();
@@ -412,15 +531,57 @@ export class GeminiVoiceBridge extends EventEmitter {
       // The socket is about to close; the close handler reconnects.
     }
 
+    const toolCall = msg.toolCall;
+    if (toolCall && typeof toolCall === 'object') {
+      this.handleToolCall(toolCall as Record<string, unknown>);
+    }
+
+    const cancellation = msg.toolCallCancellation;
+    if (cancellation && typeof cancellation === 'object') {
+      const ids = (cancellation as Record<string, unknown>).ids;
+      if (Array.isArray(ids)) {
+        this.emit(
+          'toolCancel',
+          ids.filter((id): id is string => typeof id === 'string')
+        );
+      }
+    }
+
     const serverContent = msg.serverContent;
     if (serverContent && typeof serverContent === 'object') {
       this.handleServerContent(serverContent as Record<string, unknown>);
     }
   }
 
+  private handleToolCall(toolCall: Record<string, unknown>) {
+    const calls = toolCall.functionCalls;
+    if (!Array.isArray(calls)) {
+      return;
+    }
+    for (const raw of calls) {
+      if (!raw || typeof raw !== 'object') {
+        continue;
+      }
+      const entry = raw as Record<string, unknown>;
+      const id = typeof entry.id === 'string' ? entry.id : '';
+      const name = typeof entry.name === 'string' ? entry.name : '';
+      if (!id || !name) {
+        continue;
+      }
+      const args =
+        entry.args && typeof entry.args === 'object'
+          ? (entry.args as Record<string, unknown>)
+          : {};
+      // The epoch travels with the call so a response arriving after a reconnect
+      // can be recognised as stale rather than posted into a session that has
+      // never heard of it.
+      this.emit('toolCall', { id, name, args } satisfies LiveToolCall, this.epoch);
+    }
+  }
+
   private handleServerContent(content: Record<string, unknown>) {
-    // A single frame can carry audio *and* a transcript on 3.1, so every branch
-    // below is an independent `if` — never else-if.
+    // A single frame can carry audio *and* a transcript, so every branch below is
+    // an independent `if` — never else-if.
 
     // Low-latency partial transcript. Present in the shipping SDK types but not
     // in the public reference table, so read it defensively.
@@ -432,7 +593,10 @@ export class GeminiVoiceBridge extends EventEmitter {
       }
     }
 
-    // What the user said — this is the STT result Tara acts on.
+    // What the user said. This is now only for the chat bubble: dispatch to
+    // Claude happens on `toolCall`, which arrives while the model is still
+    // talking. Waiting for a finalized transcript instead was the old design's
+    // entire latency problem.
     const input = content.inputTranscription;
     if (input && typeof input === 'object') {
       const text = (input as Record<string, unknown>).text;
@@ -440,12 +604,10 @@ export class GeminiVoiceBridge extends EventEmitter {
         this.transcript += text;
         this.emit('transcriptToken', text);
       }
-      if ((input as Record<string, unknown>).finished === true) {
-        this.finalizeTranscript();
-      }
     }
 
-    // Transcript of the model's own speech — useful for showing what Tara said.
+    // Transcript of the model's own speech — what Tara said, for the transcript
+    // pane. Arrives incrementally alongside the audio.
     const output = content.outputTranscription;
     if (output && typeof output === 'object') {
       const text = (output as Record<string, unknown>).text;
@@ -466,9 +628,11 @@ export class GeminiVoiceBridge extends EventEmitter {
             | Record<string, unknown>
             | undefined;
           const data = inlineData?.data;
-          // In 'capture' mode the model's reply is an unwanted side effect of
-          // the API always answering a turn — drop it instead of playing it.
-          if (typeof data === 'string' && data && this.mode === 'speak') {
+          // Every byte of model audio is wanted now. The old code gated this on
+          // a `mode` flag that both sides mutated, and the race was audible: a
+          // discarded turn's `turnComplete` could arrive after a spoken reply had
+          // begun, flip the flag back, and drop that reply's audio on the floor.
+          if (typeof data === 'string' && data) {
             this.emit('ttsChunk', data);
           }
         }
@@ -476,19 +640,16 @@ export class GeminiVoiceBridge extends EventEmitter {
     }
 
     if (content.interrupted === true) {
-      // Barge-in: whatever was being spoken is abandoned, so leave 'speak' mode
-      // rather than letting the next turn's audio be treated as a continuation.
-      this.mode = 'capture';
+      // The server has thrown away the rest of its generation. Anything already
+      // queued for playback belongs to that abandoned sentence, so the listener
+      // is expected to drop it rather than finish speaking a dead reply.
       this.emit('interrupted');
       this.setState('ready');
     }
 
     if (content.turnComplete === true) {
       this.finalizeTranscript();
-      if (this.mode === 'speak') {
-        this.emit('ttsDone');
-      }
-      this.mode = 'capture';
+      this.emit('ttsDone');
       this.setState('ready');
     }
   }
@@ -511,7 +672,6 @@ export class GeminiVoiceBridge extends EventEmitter {
     this.pending = [];
     this.setupDone = false;
     this.turnActive = false;
-    this.mode = 'capture';
     try {
       this.ws?.close(1000, 'client disconnect');
     } catch {

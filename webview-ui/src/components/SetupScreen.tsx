@@ -33,7 +33,16 @@ interface SetupStatus {
   voiceOptions?: VoiceOption[];
   liveModel?: string;
   liveModelOptions?: LiveModelOption[];
+  language?: string;
+  languageOptions?: LanguageOption[];
   speakResponses?: boolean;
+}
+
+interface LanguageOption {
+  /** BCP-47, or 'auto'. */
+  code: string;
+  label: string;
+  endonym?: string;
 }
 
 interface AudioOutputDevice {
@@ -85,6 +94,8 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
   const [voiceOptions, setVoiceOptions] = useState<VoiceOption[]>([]);
   const [liveModel, setLiveModel] = useState('');
   const [liveModelOptions, setLiveModelOptions] = useState<LiveModelOption[]>([]);
+  const [language, setLanguage] = useState('auto');
+  const [languageOptions, setLanguageOptions] = useState<LanguageOption[]>([]);
   const [speakResponses, setSpeakResponses] = useState(true);
 
   const [claudeStatus, setClaudeStatus] = useState<ItemStatus>('checking');
@@ -132,6 +143,8 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
       setVoiceOptions(payload.voiceOptions ?? []);
       setLiveModel(payload.liveModel ?? '');
       setLiveModelOptions(payload.liveModelOptions ?? []);
+      setLanguage(payload.language ?? 'auto');
+      setLanguageOptions(payload.languageOptions ?? []);
       setSpeakResponses(payload.speakResponses !== false);
     });
     postToExtension({ type: 'CHECK_SETUP', payload: {} });
@@ -172,6 +185,11 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
   function handleModelSelect(model: string) {
     setLiveModel(model);
     postToExtension({ type: 'SET_LIVE_MODEL', payload: { model } });
+  }
+
+  function handleLanguageSelect(code: string) {
+    setLanguage(code);
+    postToExtension({ type: 'SET_LANGUAGE', payload: { language: code } });
   }
 
   function handleSpeakToggle(enabled: boolean) {
@@ -282,10 +300,37 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
           <div className="setup-card-header">
             <span className="setup-card-icon">🗣️</span>
             <div className="setup-card-title-wrap">
-              <span className="setup-card-title">Voice &amp; Model</span>
-              <span className="setup-card-desc">How Tara sounds and which model listens</span>
+              <span className="setup-card-title">Language, Voice &amp; Model</span>
+              <span className="setup-card-desc">
+                Which language Tara speaks, how she sounds, and which model listens
+              </span>
             </div>
           </div>
+
+          {/* Outside the API-key gate on purpose: this one is a preference, not a
+              capability, so there is no reason to make it wait for a key. */}
+          <div className="setup-mic-select-wrap">
+            <label className="setup-mic-select-label" htmlFor="setup-language-select">
+              Language
+            </label>
+            <select
+              id="setup-language-select"
+              className="setup-select"
+              value={language}
+              onChange={(e) => handleLanguageSelect(e.target.value)}
+            >
+              {languageOptions.map((l) => (
+                <option key={l.code} value={l.code}>
+                  {l.endonym ? `${l.label} — ${l.endonym}` : l.label}
+                </option>
+              ))}
+            </select>
+          </div>
+          <p className="setup-card-hint">
+            {language === 'auto'
+              ? 'Tara replies in whichever language you speak to her in, and switches when you switch.'
+              : 'Tara always listens for and replies in this language. Pick your own rather than leaving it on auto-detect if you have a strong accent — being told the language is what stops it being guessed wrong.'}
+          </p>
 
           {apiKeyStatus !== 'ok' ? (
             <p className="setup-card-hint">Add your API key above to load the model list.</p>

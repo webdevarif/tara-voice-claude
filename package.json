@@ -147,6 +147,12 @@
           "default": "gemini-3.1-flash-live-preview",
           "description": "Gemini Live model for speech-to-text and text-to-speech."
         },
+        "tara.language": {
+          "type": "string",
+          "default": "auto",
+          "markdownDescription": "Which language Tara listens for and replies in — a BCP-47 code such as `bn-IN`, `en-US` or `hi-IN`, or `auto` to follow whatever you speak. Set it explicitly if you have a strong accent: left on `auto` the model has to guess the language, and a wrong guess is what turns accented speech into garbled English. Applied through the session's system instruction rather than `speechConfig.languageCode`, because native-audio Live models do not accept a language code.",
+          "description": "Language Tara listens for and replies in (BCP-47 code, or 'auto' to follow the speaker)."
+        },
         "tara.voiceName": {
           "type": "string",
           "default": "Aoede",

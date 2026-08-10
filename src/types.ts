@@ -37,6 +37,7 @@ export type TaraMessageType =
   | 'SET_SPEAKER_DEVICE'      // webview picks an output device
   | 'SET_VOICE'               // webview picks a prebuilt Gemini voice
   | 'SET_LIVE_MODEL'          // webview picks the Gemini Live model
+  | 'SET_LANGUAGE'            // webview picks the spoken language, or auto-detect
   | 'SET_SPEAK_RESPONSES'     // webview toggles whether Tara talks back
   | 'INSTALL_FFMPEG'          // webview asks for the ffmpeg install command in a terminal
   | 'SETUP_COMPLETE'          // webview reports setup finished; persist it

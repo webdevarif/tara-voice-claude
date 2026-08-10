@@ -201,6 +201,10 @@ export default function App() {
           };
           if (type === 'text' || type === 'result') {
             appendStreamingMessage(agentId ?? 'claude', text);
+          } else if (type === 'tara') {
+            // Tara's own spoken words, arriving complete rather than streamed —
+            // the host accumulates the fragments and posts one utterance.
+            appendMessage({ role: 'tara', content: text });
           } else if (type === 'tool') {
             appendMessage({ role: 'system', content: `🔧 ${text}` });
           } else if (type === 'error') {
