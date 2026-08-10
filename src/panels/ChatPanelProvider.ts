@@ -10,10 +10,10 @@ import {
 import { GeminiVoiceBridge, VoiceState } from '../voice/GeminiVoiceBridge';
 import {
   AudioInputDevice,
+  CaptureBackend,
   MicRecorder,
   ffmpegInstallCommand,
-  listInputDevices,
-  probeFfmpeg,
+  probeCapture,
 } from '../voice/MicRecorder';
 import { verifyGeminiKey } from '../voice/GeminiKeyCheck';
 import { AgentStatus, ChatEntry, TaraMessage, isRiskyCommand } from '../types';
@@ -45,10 +45,15 @@ interface SetupStatus {
   claudeAuthed: boolean;
   claudeAuthDetail?: string;
   /**
-   * Capture runs through ffmpeg in this process because VS Code's webview
+   * Capture runs in this process, not the webview, because VS Code's webview
    * iframes are built without `microphone` in their Permissions-Policy allow
    * list — see the header of MicRecorder.ts.
    */
+  captureBackend?: CaptureBackend;
+  /** True when the bundled native recorder loaded — the no-install path. */
+  bundledCaptureOk: boolean;
+  bundledCaptureError?: string;
+  bundledCaptureVersion?: string;
   ffmpegInstalled: boolean;
   ffmpegVersion?: string;
   ffmpegError?: string;
@@ -395,13 +400,14 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * The stored id, if that device is still present. dshow ids are stable per
-   * endpoint, but unplugging a USB mic retires one — falling back beats failing.
+   * The stored id, if that device is still offered by the active backend.
+   * Unplugging a USB mic retires an id, and a backend switch invalidates every
+   * id it wrote — falling back to the default beats failing to record.
    */
   private async resolveMicDevice(): Promise<string | undefined> {
     const stored = this.context.globalState.get<string>(STATE_MIC_DEVICE, '');
     if (!this.micDevices.length) {
-      this.micDevices = await listInputDevices(this.ffmpegPath());
+      this.micDevices = (await probeCapture(this.ffmpegPath())).devices;
     }
     if (stored && this.micDevices.some((d) => d.id === stored)) {
       return stored;
@@ -422,7 +428,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         payload: {
           message: this.micDevices.length
             ? 'No microphone selected.'
-            : 'No microphone was found. Check that ffmpeg is installed and a capture device is connected.',
+            : 'No microphone was found — check that a capture device is connected, then re-run the setup check.',
         },
       });
       return;
@@ -466,6 +472,8 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    // Read before stopping: stop() clears it.
+    const backend = this.recorder.activeBackend;
     // Stop the device first and wait for it to exit, so `audioStreamEnd` cannot
     // race ahead of the last chunks and truncate the utterance server-side.
     await this.recorder.stop();
@@ -473,10 +481,13 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     this.voiceBridge?.stopListening();
 
     if (this.bytesThisUtterance === 0) {
-      // Under ~450 ms of hold, the device never opened. Say why rather than
-      // letting the user wonder where their words went.
+      // Released before the device delivered anything. The bundled backend opens
+      // in ~60 ms so this is a genuinely instant tap; ffmpeg needs ~450 ms, which
+      // is easy to beat by accident, so the advice differs.
       this.addSystemMessage(
-        'No audio was captured — the microphone takes about half a second to open. Hold the button until the indicator says "listening", then speak.'
+        backend === 'ffmpeg'
+          ? 'No audio was captured — this backend takes about half a second to open the microphone. Hold the button until the indicator says "Listening", then speak.'
+          : 'No audio was captured — the button was released before the microphone delivered anything. Hold it while you speak.'
       );
     }
   }
@@ -700,20 +711,25 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       apiKeyModelWarning: this.apiKeyModelWarning || undefined,
       claudeInstalled: false,
       claudeAuthed: false,
+      bundledCaptureOk: false,
       ffmpegInstalled: false,
       ffmpegInstallCommand: ffmpegInstallCommand(),
       micDevices: [],
       micDeviceId: '',
     };
 
-    // ffmpeg is what reaches the microphone; enumerate devices only if it runs.
-    const ffmpeg = await probeFfmpeg(this.ffmpegPath());
-    status.ffmpegInstalled = ffmpeg.ok;
-    status.ffmpegVersion = ffmpeg.version;
-    status.ffmpegError = ffmpeg.error;
-    if (ffmpeg.ok) {
-      this.micDevices = await listInputDevices(this.ffmpegPath());
-      status.micDevices = this.micDevices;
+    const capture = await probeCapture(this.ffmpegPath());
+    status.captureBackend = capture.backend;
+    status.bundledCaptureOk = capture.bundledOk;
+    status.bundledCaptureError = capture.bundledError;
+    status.bundledCaptureVersion = capture.bundledVersion;
+    status.ffmpegInstalled = capture.ffmpeg.ok;
+    status.ffmpegVersion = capture.ffmpeg.version;
+    status.ffmpegError = capture.ffmpeg.error;
+
+    this.micDevices = capture.devices;
+    status.micDevices = capture.devices;
+    if (capture.devices.length) {
       const resolved = await this.resolveMicDevice();
       status.micDeviceId = resolved ?? '';
       // Persist the fallback so the picker and the next capture agree.

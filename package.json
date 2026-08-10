@@ -13,9 +13,20 @@
   "engines": {
     "vscode": "^1.85.0"
   },
-  "categories": ["AI", "Other"],
-  "keywords": ["voice", "ai", "claude", "gemini", "coding assistant"],
-  "activationEvents": ["onStartupFinished"],
+  "categories": [
+    "AI",
+    "Other"
+  ],
+  "keywords": [
+    "voice",
+    "ai",
+    "claude",
+    "gemini",
+    "coding assistant"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./out/extension.js",
   "icon": "media/tara-icon.png",
   "contributes": {
@@ -83,8 +94,8 @@
           "type": "string",
           "default": "ffmpeg",
           "scope": "machine",
-          "markdownDescription": "Path to the `ffmpeg` binary used for microphone capture (defaults to `ffmpeg` on PATH). Capture runs in the extension host because VS Code's webview iframes are created without `microphone` in their Permissions-Policy allow list, so `getUserMedia` cannot work there ([vscode#250568](https://github.com/microsoft/vscode/issues/250568)). Machine-scoped so a repository cannot point Tara at a different binary.",
-          "description": "Path to the ffmpeg binary used for microphone capture."
+          "markdownDescription": "Path to the `ffmpeg` binary used as the **fallback** microphone recorder. Tara normally records through a bundled native module and needs no external tool; ffmpeg is only used where that module has no prebuilt binary. Either way capture runs in the extension host, because VS Code's webview iframes are created without `microphone` in their Permissions-Policy allow list, so `getUserMedia` cannot work there ([vscode#250568](https://github.com/microsoft/vscode/issues/250568)). Machine-scoped so a repository cannot point Tara at a different binary.",
+          "description": "Path to the ffmpeg binary used as the fallback microphone recorder."
         },
         "tara.model": {
           "type": "string",
@@ -148,7 +159,10 @@
         },
         "tara.voiceMode": {
           "type": "string",
-          "enum": ["push-to-talk", "disabled"],
+          "enum": [
+            "push-to-talk",
+            "disabled"
+          ],
           "default": "push-to-talk",
           "description": "Voice input mode."
         },
@@ -190,14 +204,15 @@
   "devDependencies": {
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.85.0",
+    "@types/ws": "^8.5.10",
     "@typescript-eslint/eslint-plugin": "^7.0.0",
     "@typescript-eslint/parser": "^7.0.0",
-    "eslint": "^8.57.0",
-    "typescript": "^5.4.0",
     "@vscode/vsce": "^2.24.0",
-    "@types/ws": "^8.5.10"
+    "eslint": "^8.57.0",
+    "typescript": "^5.4.0"
   },
   "dependencies": {
+    "@picovoice/pvrecorder-node": "^1.2.9",
     "ws": "^8.17.0"
   }
 }

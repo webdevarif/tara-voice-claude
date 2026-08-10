@@ -5,6 +5,7 @@ interface AudioInputDevice {
   id: string;
   label: string;
   isDefault?: boolean;
+  backend?: 'pvrecorder' | 'ffmpeg';
 }
 
 interface SetupStatus {
@@ -15,6 +16,10 @@ interface SetupStatus {
   claudeVersion?: string;
   claudeAuthed?: boolean;
   claudeAuthDetail?: string;
+  captureBackend?: 'pvrecorder' | 'ffmpeg';
+  bundledCaptureOk?: boolean;
+  bundledCaptureError?: string;
+  bundledCaptureVersion?: string;
   ffmpegInstalled?: boolean;
   ffmpegVersion?: string;
   ffmpegError?: string;
@@ -39,8 +44,9 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
   // The microphone check is now "can the extension host reach a capture
   // device", not "will this document be granted getUserMedia" — the latter is
   // permanently no in a VS Code webview, so asking was misleading.
-  const [ffmpegStatus, setFfmpegStatus] = useState<ItemStatus>('checking');
-  const [ffmpegVersion, setFfmpegVersion] = useState('');
+  const [micCheck, setMicCheck] = useState<ItemStatus>('checking');
+  const [backend, setBackend] = useState<'pvrecorder' | 'ffmpeg' | undefined>(undefined);
+  const [bundledError, setBundledError] = useState('');
   const [ffmpegError, setFfmpegError] = useState('');
   const [installCommand, setInstallCommand] = useState('');
   const [micDevices, setMicDevices] = useState<AudioInputDevice[]>([]);
@@ -51,7 +57,7 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
   const [claudeAuthed, setClaudeAuthed] = useState(false);
   const [claudeAuthDetail, setClaudeAuthDetail] = useState('');
 
-  const micReady = ffmpegStatus === 'ok' && micDevices.length > 0;
+  const micReady = !!backend && micDevices.length > 0;
   const allDone = apiKeyStatus === 'ok' && micReady && claudeStatus === 'ok' && claudeAuthed;
 
   // ── Setup status from the extension host ──────────────────────────────────
@@ -75,8 +81,9 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
       setClaudeAuthed(!!payload.claudeAuthed);
       setClaudeAuthDetail(payload.claudeAuthDetail ?? '');
 
-      setFfmpegStatus(payload.ffmpegInstalled ? 'ok' : 'error');
-      setFfmpegVersion(payload.ffmpegVersion ?? '');
+      setBackend(payload.captureBackend);
+      setMicCheck(payload.captureBackend ? 'ok' : 'error');
+      setBundledError(payload.bundledCaptureError ?? '');
       setFfmpegError(payload.ffmpegError ?? '');
       setInstallCommand(payload.ffmpegInstallCommand ?? '');
       setMicDevices(payload.micDevices ?? []);
@@ -104,7 +111,7 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
   }
 
   function recheckMic() {
-    setFfmpegStatus('checking');
+    setMicCheck('checking');
     postToExtension({ type: 'CHECK_SETUP', payload: {} });
   }
 
@@ -191,31 +198,66 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
           )}
         </div>
 
-        {/* 2 — Microphone, captured by ffmpeg in the extension host */}
+        {/* 2 — Microphone, captured in the extension host, not this webview */}
         <div
           className={`setup-card ${
-            micReady ? 'card-ok' : ffmpegStatus === 'error' ? 'card-error' : ''
+            micReady ? 'card-ok' : micCheck === 'error' ? 'card-error' : ''
           }`}
         >
           <div className="setup-card-header">
             <span className="setup-card-icon">🎤</span>
             <div className="setup-card-title-wrap">
-              <span className="setup-card-title">Microphone (ffmpeg)</span>
+              <span className="setup-card-title">Microphone</span>
               <span className="setup-card-desc">Required for push-to-talk voice input</span>
             </div>
-            <StatusBadge
-              status={micReady ? 'ok' : ffmpegStatus === 'checking' ? 'checking' : ffmpegStatus}
-            />
+            <StatusBadge status={micReady ? 'ok' : micCheck} />
           </div>
 
-          {ffmpegStatus === 'checking' && <p className="setup-card-hint">Looking for ffmpeg…</p>}
+          {micCheck === 'checking' && (
+            <p className="setup-card-hint">Looking for a capture device…</p>
+          )}
 
-          {ffmpegStatus === 'error' && (
+          {micReady && (
+            <div className="setup-mic-granted">
+              <p className="setup-card-ok-msg">
+                {backend === 'pvrecorder'
+                  ? '✓ Ready — built in, nothing to install'
+                  : '✓ Ready — using ffmpeg'}
+              </p>
+              {backend === 'ffmpeg' && (
+                <p className="setup-card-hint">
+                  The built-in recorder could not load on this machine, so Tara fell back to
+                  ffmpeg. Voice still works; the microphone just takes about half a second longer
+                  to open.
+                </p>
+              )}
+              <div className="setup-mic-select-wrap">
+                <label className="setup-mic-select-label" htmlFor="setup-mic-select">
+                  Input device
+                </label>
+                <select
+                  id="setup-mic-select"
+                  className="setup-select"
+                  value={selectedMicId}
+                  onChange={(e) => handleMicSelect(e.target.value)}
+                >
+                  {micDevices.map((dev, i) => (
+                    <option key={dev.id} value={dev.id}>
+                      {dev.label || `Microphone ${i + 1}`}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+          )}
+
+          {micCheck === 'error' && (
             <div className="setup-card-action setup-card-action-col">
-              <p className="setup-card-error-msg">✕ ffmpeg not found</p>
+              <p className="setup-card-error-msg">✕ No microphone available</p>
               <p className="setup-card-hint">
-                Tara records through ffmpeg because VS Code does not grant webviews microphone
-                access, so the browser API cannot be used here.
+                Tara records in the extension host, not in this panel, because VS Code does not
+                grant webviews microphone access. The built-in recorder did not load here, and
+                ffmpeg — the fallback — was not found either.
               </p>
               {installCommand && (
                 <div className="setup-code-block">
@@ -236,45 +278,8 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
               >
                 Check again
               </button>
-              {ffmpegError && <p className="setup-card-hint">{ffmpegError}</p>}
-            </div>
-          )}
-
-          {ffmpegStatus === 'ok' && (
-            <div className="setup-mic-granted">
-              <p className="setup-card-ok-msg">
-                ✓ {ffmpegVersion.replace(/^ffmpeg version /i, '').split(' ')[0] || 'ffmpeg ready'}
-              </p>
-              {micDevices.length > 0 ? (
-                <div className="setup-mic-select-wrap">
-                  <label className="setup-mic-select-label" htmlFor="setup-mic-select">
-                    Input device
-                  </label>
-                  <select
-                    id="setup-mic-select"
-                    className="setup-select"
-                    value={selectedMicId}
-                    onChange={(e) => handleMicSelect(e.target.value)}
-                  >
-                    {micDevices.map((dev, i) => (
-                      <option key={dev.id} value={dev.id}>
-                        {dev.label || `Microphone ${i + 1}`}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              ) : (
-                <div className="setup-card-action setup-card-action-col">
-                  <p className="setup-card-error-msg">✕ No capture device found</p>
-                  <button
-                    id="setup-mic-retry-btn"
-                    className="setup-btn setup-btn-ghost"
-                    onClick={recheckMic}
-                  >
-                    Check again
-                  </button>
-                </div>
-              )}
+              {bundledError && <p className="setup-card-hint">Built-in: {bundledError}</p>}
+              {ffmpegError && <p className="setup-card-hint">ffmpeg: {ffmpegError}</p>}
             </div>
           )}
         </div>

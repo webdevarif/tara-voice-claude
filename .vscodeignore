@@ -2,6 +2,15 @@
 # by GeminiVoiceBridge, and vsce already prunes devDependencies when packaging.
 # A blanket node_modules ignore made `import('ws')` fail with MODULE_NOT_FOUND in
 # an installed build while working fine from the debug host.
+#
+# @picovoice/pvrecorder-node ships the prebuilt capture binaries, so its lib/**
+# must stay. Only its build-time cruft is dropped below — never lib/.
+node_modules/@picovoice/pvrecorder-node/src/**
+node_modules/@picovoice/pvrecorder-node/copy.js
+node_modules/@picovoice/pvrecorder-node/jest.config.js
+node_modules/@picovoice/pvrecorder-node/tsconfig.json
+node_modules/@picovoice/pvrecorder-node/.eslint*
+node_modules/@picovoice/pvrecorder-node/.prettierrc
 .vscode/**
 .vscode-test/**
 src/**
