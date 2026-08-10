@@ -16,6 +16,12 @@ import {
   probeCapture,
 } from '../voice/MicRecorder';
 import { verifyGeminiKey } from '../voice/GeminiKeyCheck';
+import {
+  LiveModelOption,
+  PREBUILT_VOICES,
+  VoiceOption,
+  listLiveModels,
+} from '../voice/GeminiCatalog';
 import { AgentStatus, ChatEntry, TaraMessage, isRiskyCommand } from '../types';
 
 /** SecretStorage key. Superseded the `tara.geminiApiKey` setting, which leaked via settings sync. */
@@ -60,6 +66,14 @@ interface SetupStatus {
   ffmpegInstallCommand: string;
   micDevices: AudioInputDevice[];
   micDeviceId: string;
+  /** Current `tara.voiceName`, plus the documented set to choose from. */
+  voiceName: string;
+  voiceOptions: VoiceOption[];
+  /** Current `tara.geminiLiveModel`, plus what this key can open a session with. */
+  liveModel: string;
+  /** Empty when the key is missing or the listing failed — not "no models". */
+  liveModelOptions: LiveModelOption[];
+  speakResponses: boolean;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -253,6 +267,28 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     return (
       vscode.workspace.getConfiguration('tara').get<string>('geminiLiveModel') ?? ''
     );
+  }
+
+  /**
+   * Writes one of the voice settings and drops any open session, because the
+   * voice and the model are fixed in the Live setup frame — an existing socket
+   * would keep using the old ones until it happened to be replaced.
+   */
+  private async updateVoiceSetting(
+    key: 'voiceName' | 'geminiLiveModel' | 'speakResponses',
+    value: string | boolean | undefined
+  ) {
+    if (value === undefined || value === '') {
+      return;
+    }
+    await vscode.workspace
+      .getConfiguration('tara')
+      .update(key, value, vscode.ConfigurationTarget.Global);
+    if (key !== 'speakResponses') {
+      this.voiceBridge?.dispose();
+      this.voiceBridge = undefined;
+    }
+    await this.runSetupCheck();
   }
 
   /**
@@ -567,6 +603,24 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         break;
       }
 
+      case 'SET_VOICE': {
+        const { voiceName } = msg.payload as { voiceName?: string };
+        await this.updateVoiceSetting('voiceName', voiceName);
+        break;
+      }
+
+      case 'SET_LIVE_MODEL': {
+        const { model } = msg.payload as { model?: string };
+        await this.updateVoiceSetting('geminiLiveModel', model);
+        break;
+      }
+
+      case 'SET_SPEAK_RESPONSES': {
+        const { enabled } = msg.payload as { enabled?: boolean };
+        await this.updateVoiceSetting('speakResponses', !!enabled);
+        break;
+      }
+
       case 'OPEN_URL': {
         const { url } = msg.payload as { url: string };
         // Only follow links we generated — never an arbitrary string from the webview.
@@ -716,7 +770,18 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       ffmpegInstallCommand: ffmpegInstallCommand(),
       micDevices: [],
       micDeviceId: '',
+      voiceName: config.get<string>('voiceName') || 'Aoede',
+      voiceOptions: PREBUILT_VOICES,
+      liveModel: this.liveModel(),
+      liveModelOptions: [],
+      speakResponses: config.get<boolean>('speakResponses', true),
     };
+
+    // Only ask for the model list once the key has earned it; an unverified key
+    // would just produce a 400 here.
+    if (geminiKey && storedKey) {
+      status.liveModelOptions = await listLiveModels(storedKey);
+    }
 
     const capture = await probeCapture(this.ffmpegPath());
     status.captureBackend = capture.backend;

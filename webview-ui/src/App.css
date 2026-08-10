@@ -239,6 +239,24 @@
   font-style: italic;
 }
 
+.setup-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--text-xs);
+  color: var(--text-2);
+  cursor: pointer;
+  /* The label is the hit target, so it needs its own vertical rhythm inside the
+     card's flex column rather than relying on the sibling gap alone. */
+  padding: 2px 0;
+}
+
+.setup-toggle input {
+  accent-color: var(--accent);
+  cursor: pointer;
+  margin: 0;
+}
+
 .setup-code-block {
   display: flex;
   align-items: center;

@@ -48,13 +48,17 @@ export interface KeyCheckResult {
   modelWarning?: string;
 }
 
-interface HttpResult {
+export interface HttpResult {
   status?: number;
   body: string;
   networkError?: string;
 }
 
-function get(path: string, apiKey: string): Promise<HttpResult> {
+/**
+ * Shared by the other setup-time REST callers so the key-in-header rule and the
+ * body cap are stated once.
+ */
+export function geminiGet(path: string, apiKey: string): Promise<HttpResult> {
   return new Promise((resolve) => {
     let settled = false;
     const finish = (result: HttpResult) => {
@@ -147,7 +151,7 @@ export async function verifyGeminiKey(
   // `models.list` is the authoritative check: it is a known-good route, so an
   // unexpected status from it is a real signal rather than a wrong guess about
   // which endpoints exist.
-  const list = await get('/v1beta/models', key);
+  const list = await geminiGet('/v1beta/models', key);
 
   if (list.networkError) {
     return {
@@ -195,7 +199,7 @@ export async function verifyGeminiKey(
 
   const model = bareModelId(liveModel ?? '');
   if (model) {
-    const one = await get(`/v1beta/models/${encodeURIComponent(model)}`, key);
+    const one = await geminiGet(`/v1beta/models/${encodeURIComponent(model)}`, key);
     // Only a definite 404 is worth reporting. Any other outcome — including a
     // network blip on this second call — leaves the hint off rather than
     // inventing a problem.

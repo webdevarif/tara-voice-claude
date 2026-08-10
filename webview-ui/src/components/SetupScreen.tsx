@@ -26,6 +26,22 @@ interface SetupStatus {
   ffmpegInstallCommand?: string;
   micDevices?: AudioInputDevice[];
   micDeviceId?: string;
+  voiceName?: string;
+  voiceOptions?: VoiceOption[];
+  liveModel?: string;
+  liveModelOptions?: LiveModelOption[];
+  speakResponses?: boolean;
+}
+
+interface VoiceOption {
+  name: string;
+  character: string;
+}
+
+interface LiveModelOption {
+  id: string;
+  label: string;
+  description?: string;
 }
 
 interface SetupScreenProps {
@@ -51,6 +67,12 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
   const [installCommand, setInstallCommand] = useState('');
   const [micDevices, setMicDevices] = useState<AudioInputDevice[]>([]);
   const [selectedMicId, setSelectedMicId] = useState('');
+
+  const [voiceName, setVoiceName] = useState('');
+  const [voiceOptions, setVoiceOptions] = useState<VoiceOption[]>([]);
+  const [liveModel, setLiveModel] = useState('');
+  const [liveModelOptions, setLiveModelOptions] = useState<LiveModelOption[]>([]);
+  const [speakResponses, setSpeakResponses] = useState(true);
 
   const [claudeStatus, setClaudeStatus] = useState<ItemStatus>('checking');
   const [claudeVersion, setClaudeVersion] = useState('');
@@ -88,6 +110,12 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
       setInstallCommand(payload.ffmpegInstallCommand ?? '');
       setMicDevices(payload.micDevices ?? []);
       setSelectedMicId(payload.micDeviceId ?? '');
+
+      setVoiceName(payload.voiceName ?? '');
+      setVoiceOptions(payload.voiceOptions ?? []);
+      setLiveModel(payload.liveModel ?? '');
+      setLiveModelOptions(payload.liveModelOptions ?? []);
+      setSpeakResponses(payload.speakResponses !== false);
     });
     postToExtension({ type: 'CHECK_SETUP', payload: {} });
     return cleanup;
@@ -114,6 +142,35 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
     setMicCheck('checking');
     postToExtension({ type: 'CHECK_SETUP', payload: {} });
   }
+
+  /**
+   * Applied optimistically so the select does not snap back while the host
+   * writes the setting; the next SETUP_STATUS is the source of truth.
+   */
+  function handleVoiceSelect(name: string) {
+    setVoiceName(name);
+    postToExtension({ type: 'SET_VOICE', payload: { voiceName: name } });
+  }
+
+  function handleModelSelect(model: string) {
+    setLiveModel(model);
+    postToExtension({ type: 'SET_LIVE_MODEL', payload: { model } });
+  }
+
+  function handleSpeakToggle(enabled: boolean) {
+    setSpeakResponses(enabled);
+    postToExtension({ type: 'SET_SPEAK_RESPONSES', payload: { enabled } });
+  }
+
+  /**
+   * The configured model may not be in the fetched list — a preview id the
+   * listing omits, or a listing that failed. Showing it anyway keeps the select
+   * from silently displaying someone else's model as if it were the setting.
+   */
+  const modelChoices =
+    liveModel && !liveModelOptions.some((m) => m.id === liveModel)
+      ? [{ id: liveModel, label: `${liveModel} (configured)` }, ...liveModelOptions]
+      : liveModelOptions;
 
   function recheckClaude() {
     setClaudeStatus('checking');
@@ -198,7 +255,82 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
           )}
         </div>
 
-        {/* 2 — Microphone, captured in the extension host, not this webview */}
+        {/* 2 — Voice and model. Not part of the gate: both have working defaults. */}
+        <div className="setup-card">
+          <div className="setup-card-header">
+            <span className="setup-card-icon">🗣️</span>
+            <div className="setup-card-title-wrap">
+              <span className="setup-card-title">Voice &amp; Model</span>
+              <span className="setup-card-desc">How Tara sounds and which model listens</span>
+            </div>
+          </div>
+
+          {apiKeyStatus !== 'ok' ? (
+            <p className="setup-card-hint">Add your API key above to load the model list.</p>
+          ) : (
+            <>
+              <div className="setup-mic-select-wrap">
+                <label className="setup-mic-select-label" htmlFor="setup-voice-select">
+                  Voice
+                </label>
+                <select
+                  id="setup-voice-select"
+                  className="setup-select"
+                  value={voiceName}
+                  onChange={(e) => handleVoiceSelect(e.target.value)}
+                >
+                  {voiceOptions.map((v) => (
+                    <option key={v.name} value={v.name}>
+                      {v.name} — {v.character}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="setup-mic-select-wrap">
+                <label className="setup-mic-select-label" htmlFor="setup-model-select">
+                  Live model
+                </label>
+                <select
+                  id="setup-model-select"
+                  className="setup-select"
+                  value={liveModel}
+                  onChange={(e) => handleModelSelect(e.target.value)}
+                  disabled={modelChoices.length === 0}
+                >
+                  {modelChoices.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {liveModelOptions.length === 0 && (
+                <p className="setup-card-hint">
+                  Could not list models for this key, so only the configured one is shown.
+                </p>
+              )}
+
+              <label className="setup-toggle" htmlFor="setup-speak-toggle">
+                <input
+                  id="setup-speak-toggle"
+                  type="checkbox"
+                  checked={speakResponses}
+                  onChange={(e) => handleSpeakToggle(e.target.checked)}
+                />
+                <span>Read questions and warnings aloud</span>
+              </label>
+
+              <p className="setup-card-hint">
+                Only models that support a live bidirectional session are listed. Voices come from
+                Google&apos;s published set; a few may not be offered on every model.
+              </p>
+            </>
+          )}
+        </div>
+
+        {/* 3 — Microphone, captured in the extension host, not this webview */}
         <div
           className={`setup-card ${
             micReady ? 'card-ok' : micCheck === 'error' ? 'card-error' : ''
