@@ -692,6 +692,18 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   private static readonly PREROLL_BYTES = 16000 * 2 * 0.3;
 
   private micEnabled = false;
+  /**
+   * Held deaf on purpose, as opposed to switched off or asleep.
+   *
+   * This genuinely stops the recorder rather than discarding chunks further down.
+   * Keeping the device open and throwing the audio away would leave the operating
+   * system's microphone indicator lit while the UI said "muted", and a privacy
+   * control that lies about whether the microphone is running is worse than no
+   * control at all. What it does keep is everything above the device: the session,
+   * the voice profile, whether she is awake. Unmuting reopens one device; it does
+   * not rebuild a conversation.
+   */
+  private micMuted = false;
   private awake = true;
   /** A Gemini turn is open and chunks are being forwarded. */
   private streaming = false;
@@ -1353,6 +1365,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
 
     if (!enabled) {
       this.micEnabled = false;
+      // Cleared with the session, not carried into the next one: switching voice
+      // back on and finding it silently deaf would read as a broken microphone.
+      this.micMuted = false;
       this.clearTimers();
       await this.endTurn();
       await this.recorder.stop();
@@ -1407,9 +1422,70 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     this.armSleepTimer();
   }
 
+  /**
+   * Mutes or unmutes the microphone, keeping the session.
+   *
+   * Idempotent, and a no-op while voice is switched off entirely — muting
+   * something that is already silent should not be a state you can get stuck in.
+   */
+  async setMicMuted(muted: boolean): Promise<void> {
+    if (!this.micEnabled || muted === this.micMuted) {
+      return;
+    }
+    this.micMuted = muted;
+
+    if (muted) {
+      // Any half-spoken turn is closed before the device goes: leaving one open
+      // would sit waiting on the server's silence timer for audio that is never
+      // coming.
+      await this.endTurn();
+      await this.recorder.stop();
+      this.vad.reset();
+      this.resetVerify();
+      this.preroll = [];
+      this.prerollBytes = 0;
+      // Silence while muted is not the kind of silence sleeping is for.
+      this.clearSleepTimer();
+      this.postMicState();
+      return;
+    }
+
+    const deviceId = await this.resolveMicDevice();
+    if (!deviceId) {
+      this.micMuted = true;
+      this.postMicState();
+      this.postMessage({
+        type: 'ERROR',
+        payload: { message: 'No microphone is available to unmute.' },
+      });
+      return;
+    }
+    try {
+      await this.recorder.start(this.ffmpegPath(), deviceId);
+    } catch (err) {
+      // Stay muted rather than claiming to listen with a dead device.
+      this.micMuted = true;
+      this.postMicState();
+      this.postMessage({
+        type: 'ERROR',
+        payload: {
+          message: err instanceof Error ? err.message : 'Could not reopen the microphone.',
+        },
+      });
+      return;
+    }
+    if (this.awake) {
+      this.armSleepTimer();
+    }
+    this.postMicState();
+  }
+
   /** Every captured chunk passes through here, whether or not it is sent on. */
   private handleAudioChunk(chunk: Buffer) {
-    if (!this.micEnabled) {
+    // Belt and braces: the recorder is stopped while muted, so this should never
+    // fire — but a chunk already in flight when stop() was called must not be the
+    // one thing that gets through after the user asked for silence.
+    if (!this.micEnabled || this.micMuted) {
       return;
     }
 
@@ -1735,6 +1811,12 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       case 'SET_MIC_ENABLED': {
         const { enabled } = msg.payload as { enabled?: boolean };
         await this.setMicEnabled(!!enabled);
+        break;
+      }
+
+      case 'SET_MIC_MUTED': {
+        const { muted } = msg.payload as { muted?: boolean };
+        await this.setMicMuted(!!muted);
         break;
       }
 

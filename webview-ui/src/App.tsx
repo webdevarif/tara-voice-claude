@@ -146,6 +146,18 @@ export default function App() {
     postToExtension({ type: 'SET_MIC_ENABLED', payload: { enabled } });
   }, []);
 
+  /**
+   * Applied optimistically like the toggle above, and for a stronger reason:
+   * muting is a privacy action, so the indicator has to change the instant it is
+   * asked for rather than once the device has finished closing. The host's next
+   * VOICE_STATE is still the source of truth.
+   */
+  const handleToggleMute = useCallback(() => {
+    const muted = micStateRef.current !== 'muted';
+    setMicState(muted ? 'muted' : 'listening');
+    postToExtension({ type: 'SET_MIC_MUTED', payload: { muted } });
+  }, []);
+
   // ── Extension messages ────────────────────────────────────────────────────
 
   useEffect(() => {
@@ -475,7 +487,11 @@ export default function App() {
         />
       )}
 
-      <VoiceOrb micState={micState} onToggle={handleToggleMic} />
+      <VoiceOrb
+        micState={micState}
+        onToggle={handleToggleMic}
+        onToggleMute={handleToggleMute}
+      />
 
       <div className="tara-input-bar">
         <form className="tara-text-form" onSubmit={handleSubmit}>

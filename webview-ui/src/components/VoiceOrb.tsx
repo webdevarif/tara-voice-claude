@@ -5,12 +5,14 @@ import { useEffect, useRef, useState } from 'react';
  * are different facts, and conflating them is what makes hands-free listening
  * feel broken — you cannot tell whether it is your turn.
  */
-export type MicState = 'off' | 'listening' | 'hearing' | 'asleep';
+export type MicState = 'off' | 'muted' | 'listening' | 'hearing' | 'asleep';
 
 interface VoiceOrbProps {
   micState: MicState;
   /** A click switches listening on or off. There is no hold. */
   onToggle: () => void;
+  /** Holds the microphone deaf without ending the session. */
+  onToggleMute: () => void;
 }
 
 const NUM_BARS = 32;
@@ -21,6 +23,7 @@ const CENTER = 80;        // SVG viewBox center
 
 const LABEL: Record<MicState, string> = {
   off: 'Click to talk',
+  muted: 'Muted — she cannot hear you',
   listening: 'Listening',
   hearing: 'Hearing you…',
   asleep: 'Asleep — say "wake up"',
@@ -28,16 +31,18 @@ const LABEL: Record<MicState, string> = {
 
 const TITLE: Record<MicState, string> = {
   off: 'Start listening',
+  muted: 'Microphone off. The session is still open — unmute to carry on',
   listening: 'Listening — click to stop',
   hearing: 'Picking up your voice',
   asleep: 'Sleeping after 15s of silence — say "wake up", or click to stop',
 };
 
-export function VoiceOrb({ micState, onToggle }: VoiceOrbProps) {
+export function VoiceOrb({ micState, onToggle, onToggleMute }: VoiceOrbProps) {
   const [bars, setBars] = useState<number[]>(Array(NUM_BARS).fill(BAR_MIN));
   const animFrameRef = useRef<number>(0);
   const live = micState === 'hearing';
   const on = micState !== 'off';
+  const muted = micState === 'muted';
 
   // ── Bar animation ─────────────────────────────────────────────────────────
   // There is no AnalyserNode to drive this: the samples never enter this
@@ -185,12 +190,16 @@ export function VoiceOrb({ micState, onToggle }: VoiceOrbProps) {
               strokeWidth="1.5" strokeLinecap="round"
               style={{ transition: 'stroke 0.3s ease' }}
             />
-            {micState === 'asleep' && (
-              // A slash across the mic: sleeping is not the same as off, but it
-              // is also not listening for commands, and the label alone is easy
-              // to miss.
+            {(micState === 'asleep' || muted) && (
+              // A slash across the mic. Sleeping is not the same as off but is
+              // also not listening for commands; muted is not listening at all.
+              // Either way the label alone is easy to miss, and "is it hearing
+              // me?" is the one question this control has to answer at a glance.
               <line x1="1" y1="1" x2="15" y2="17"
-                stroke={iconCol} strokeWidth="1.5" strokeLinecap="round" opacity="0.8"
+                stroke={muted ? '#e0574a' : iconCol}
+                strokeWidth={muted ? 2 : 1.5}
+                strokeLinecap="round"
+                opacity={muted ? 1 : 0.8}
               />
             )}
           </g>
@@ -199,6 +208,33 @@ export function VoiceOrb({ micState, onToggle }: VoiceOrbProps) {
         {/* Label */}
         <span className="voice-orb-label">{LABEL[micState]}</span>
       </button>
+
+      {/* Mute, beside the orb rather than inside it: the orb ends the session,
+          this only stops it hearing, and one control doing both would make the
+          quick action the risky one. Hidden while voice is off, where there is
+          nothing to mute. */}
+      {on && (
+        <button
+          className={`voice-orb-mute ${muted ? 'is-muted' : ''}`}
+          onClick={onToggleMute}
+          title={muted ? 'Unmute the microphone' : 'Mute the microphone, keeping the session'}
+          aria-label={muted ? 'Unmute the microphone' : 'Mute the microphone'}
+          aria-pressed={muted}
+        >
+          <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">
+            <rect x="5.5" y="1" width="5" height="8.5" rx="2.5"
+              fill="none" stroke="currentColor" strokeWidth="1.4" />
+            <path d="M3 7.5a5 5 0 0 0 10 0"
+              fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+            <line x1="8" y1="12.5" x2="8" y2="15"
+              stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+            {muted && (
+              <line x1="2" y1="1.5" x2="14" y2="14.5"
+                stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+            )}
+          </svg>
+        </button>
+      )}
     </div>
   );
 }

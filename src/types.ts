@@ -19,6 +19,7 @@ export type TaraMessageType =
   // Webview → Extension
   | 'WEBVIEW_READY'           // webview has subscribed and wants its initial state
   | 'SET_MIC_ENABLED'         // user switched hands-free listening on or off
+  | 'SET_MIC_MUTED'           // user held the mic deaf without ending the session
   | 'LIST_SESSIONS'           // webview asks for this project's session list
   | 'NEW_SESSION'             // start a fresh conversation in this project
   | 'OPEN_SESSION'            // switch to a stored conversation

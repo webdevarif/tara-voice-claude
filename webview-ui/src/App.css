@@ -251,6 +251,50 @@
   transition: width 200ms ease-out;
 }
 
+/* Mute sits beside the orb, not on it. Absolute rather than in the flow so the
+   orb stays optically centred — a button in the flow would shift it sideways,
+   and the orb is what the eye lands on. */
+.voice-orb-wrapper {
+  position: relative;
+}
+
+.voice-orb-mute {
+  position: absolute;
+  top: 50%;
+  right: 8px;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--bg-2);
+  color: var(--text-3);
+  cursor: pointer;
+  transition: color 0.2s ease, border-color 0.2s ease, background 0.2s ease;
+}
+
+.voice-orb-mute:hover {
+  color: var(--text-1);
+  border-color: var(--border-hi);
+}
+
+/* Muted is red and filled, not merely dimmed: "is it hearing me?" has to be
+   answerable at a glance, and a subtle state is how someone ends up assuming
+   they were muted when they were not. */
+.voice-orb-mute.is-muted {
+  color: #fff;
+  background: #b5372c;
+  border-color: #e0574a;
+}
+
+.voice-orb-mute.is-muted:hover {
+  background: #c8402f;
+}
+
 .setup-checking-msg {
   font-size: var(--text-xs);
   color: var(--text-3);
