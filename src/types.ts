@@ -30,6 +30,7 @@ export type TaraMessageType =
   | 'SAVE_API_KEY'            // webview sends gemini API key to save
   | 'OPEN_URL'                // webview asks extension to open a URL
   | 'SET_MIC_DEVICE'          // webview picks a capture device
+  | 'SET_SPEAKER_DEVICE'      // webview picks an output device
   | 'SET_VOICE'               // webview picks a prebuilt Gemini voice
   | 'SET_LIVE_MODEL'          // webview picks the Gemini Live model
   | 'SET_SPEAK_RESPONSES'     // webview toggles whether Tara talks back

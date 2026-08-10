@@ -17,6 +17,11 @@ import {
 } from '../voice/MicRecorder';
 import { verifyGeminiKey } from '../voice/GeminiKeyCheck';
 import {
+  AudioOutputDevice,
+  SpeakerPlayer,
+  probeSpeakers,
+} from '../voice/SpeakerPlayer';
+import {
   LiveModelOption,
   PREBUILT_VOICES,
   VoiceOption,
@@ -28,6 +33,7 @@ import { AgentStatus, ChatEntry, TaraMessage, isRiskyCommand } from '../types';
 const SECRET_GEMINI_KEY = 'tara.geminiApiKey';
 const STATE_SETUP_COMPLETE = 'tara.setupComplete';
 const STATE_MIC_DEVICE = 'tara.micDeviceId';
+const STATE_SPEAKER_DEVICE = 'tara.speakerDeviceId';
 /**
  * Whether the key currently in SecretStorage has been proven to work. Only
  * `setApiKey` writes the key, so this cannot drift away from it. A key that
@@ -66,6 +72,13 @@ interface SetupStatus {
   ffmpegInstallCommand: string;
   micDevices: AudioInputDevice[];
   micDeviceId: string;
+  /**
+   * Output devices, named. This is only possible because playback runs in the
+   * host: a webview cannot read device labels without a media permission.
+   */
+  speakerDevices: AudioOutputDevice[];
+  speakerDeviceId: string;
+  speakerError?: string;
   /** Current `tara.voiceName`, plus the documented set to choose from. */
   voiceName: string;
   voiceOptions: VoiceOption[];
@@ -93,6 +106,8 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   private voiceStopPending = false;
   /** Microphone capture, in this process rather than the webview. */
   private readonly recorder = new MicRecorder();
+  /** Playback, also in this process — see SpeakerPlayer's header for why. */
+  private readonly speaker = new SpeakerPlayer();
   /** Cached from the last setup check so a press does not re-probe. */
   private micDevices: AudioInputDevice[] = [];
   private bytesThisUtterance = 0;
@@ -387,7 +402,14 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       void this.submitUserText(transcript);
     });
     bridge.on('ttsChunk', (base64: string) => {
-      this.postMessage({ type: 'TTS_AUDIO_CHUNK', payload: { base64 } });
+      // Played here when the bundled output module is available, so the user can
+      // choose a named device. The webview's PcmPlayer is the fallback for
+      // platforms without a prebuilt binary.
+      if (this.speaker.available) {
+        this.speaker.enqueue(Buffer.from(base64, 'base64'));
+      } else {
+        this.postMessage({ type: 'TTS_AUDIO_CHUNK', payload: { base64 } });
+      }
     });
     bridge.on('ttsDone', () => {
       this.postMessage({ type: 'TTS_DONE', payload: {} });
@@ -413,17 +435,63 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     return bridge;
   }
 
-  /** Speaks `text` if voice is configured. Never creates a connection just to talk. */
+  /**
+   * How much of an answer to read out. Past this it stops being useful — nobody
+   * listens to four paragraphs of prose read at conversational speed — so the
+   * text is cut at a sentence end and the rest is left on screen to read.
+   */
+  private static readonly MAX_SPOKEN_CHARS = 700;
+
+  /**
+   * Turns an agent's answer into something worth hearing. Code blocks, paths and
+   * bullet markers are unlistenable read aloud, and reading them is what makes
+   * spoken output feel broken rather than helpful.
+   */
+  static toSpeech(text: string): string {
+    let spoken = text
+      // Fenced code: say that it happened instead of reading the contents.
+      .replace(/```[\s\S]*?```/g, ' (code omitted) ')
+      .replace(/`([^`]+)`/g, '$1')
+      // Markdown emphasis and headings carry nothing in speech.
+      .replace(/^#{1,6}\s+/gm, '')
+      .replace(/\*\*([^*]+)\*\*/g, '$1')
+      .replace(/(^|\s)[*_]([^*_\n]+)[*_](?=\s|$)/g, '$1$2')
+      .replace(/^\s*[-*+]\s+/gm, '')
+      // Links: keep the words, drop the URL.
+      .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    if (spoken.length <= ChatPanelProvider.MAX_SPOKEN_CHARS) {
+      return spoken;
+    }
+    const cut = spoken.slice(0, ChatPanelProvider.MAX_SPOKEN_CHARS);
+    // Prefer a sentence boundary, but only if one is reasonably near the end —
+    // otherwise a text with no punctuation would be cut to almost nothing.
+    const lastStop = Math.max(cut.lastIndexOf('. '), cut.lastIndexOf('? '), cut.lastIndexOf('! '));
+    spoken = lastStop > ChatPanelProvider.MAX_SPOKEN_CHARS * 0.5 ? cut.slice(0, lastStop + 1) : cut;
+    return `${spoken.trim()} — the rest is on screen.`;
+  }
+
+  /**
+   * Speaks `text` when `tara.speakResponses` is on, opening a session if one is
+   * not already up. It used to return early without a bridge, which meant an
+   * answer typed rather than dictated was never spoken at all.
+   */
   private async speak(text: string) {
     if (!vscode.workspace.getConfiguration('tara').get<boolean>('speakResponses', true)) {
       return;
     }
-    const bridge = this.voiceBridge;
+    const spoken = ChatPanelProvider.toSpeech(text);
+    if (!spoken) {
+      return;
+    }
+    const bridge = await this.getOrCreateVoiceBridge();
     if (!bridge) {
       return;
     }
     try {
-      await bridge.speak(text);
+      await bridge.speak(spoken);
     } catch {
       // Speech is a nicety — never let it break the task flow.
     }
@@ -603,6 +671,13 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         break;
       }
 
+      case 'SET_SPEAKER_DEVICE': {
+        const { deviceId } = msg.payload as { deviceId?: string };
+        await this.context.globalState.update(STATE_SPEAKER_DEVICE, deviceId ?? '');
+        this.speaker.setDevice(deviceId ?? '');
+        break;
+      }
+
       case 'SET_VOICE': {
         const { voiceName } = msg.payload as { voiceName?: string };
         await this.updateVoiceSetting('voiceName', voiceName);
@@ -720,6 +795,13 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       this.addEntry('system', `✕ ${data.text}`);
     }
     this.postMessage({ type: 'AGENT_OUTPUT', payload: { agentId, ...data } });
+
+    // Only the final result is spoken. `text` events stream in fragments, so
+    // speaking those would talk over itself; and this is the one line the user
+    // is actually waiting to hear. Questions and warnings speak elsewhere.
+    if (data.type === 'result' && data.text.trim()) {
+      void this.speak(data.text);
+    }
   }
 
   // ── Setup check ────────────────────────────────────────────────────────────
@@ -770,6 +852,8 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       ffmpegInstallCommand: ffmpegInstallCommand(),
       micDevices: [],
       micDeviceId: '',
+      speakerDevices: [],
+      speakerDeviceId: '',
       voiceName: config.get<string>('voiceName') || 'Aoede',
       voiceOptions: PREBUILT_VOICES,
       liveModel: this.liveModel(),
@@ -791,6 +875,23 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     status.ffmpegInstalled = capture.ffmpeg.ok;
     status.ffmpegVersion = capture.ffmpeg.version;
     status.ffmpegError = capture.ffmpeg.error;
+
+    // Output devices come from the bundled module only; there is no ffmpeg
+    // fallback for playback because the webview's PcmPlayer already is one.
+    const speakers = probeSpeakers();
+    status.speakerDevices = speakers.devices;
+    status.speakerError = speakers.ok ? undefined : speakers.error;
+    if (speakers.ok) {
+      const storedSpeaker = this.context.globalState.get<string>(STATE_SPEAKER_DEVICE, '');
+      const resolved = speakers.devices.some((d) => d.id === storedSpeaker)
+        ? storedSpeaker
+        : (speakers.devices.find((d) => d.isDefault) ?? speakers.devices[0]).id;
+      status.speakerDeviceId = resolved;
+      if (resolved !== storedSpeaker) {
+        await this.context.globalState.update(STATE_SPEAKER_DEVICE, resolved);
+      }
+      this.speaker.setDevice(resolved);
+    }
 
     this.micDevices = capture.devices;
     status.micDevices = capture.devices;
@@ -902,8 +1003,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   dispose() {
     this.disposeViewListeners();
     // Before the bridge, so no chunk is emitted at a disposed listener — and so
-    // the microphone is released even if the bridge teardown throws.
+    // the devices are released even if the bridge teardown throws.
     this.recorder.dispose();
+    this.speaker.dispose();
     this.voiceBridge?.dispose();
     this.voiceBridge = undefined;
   }

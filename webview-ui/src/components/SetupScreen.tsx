@@ -26,11 +26,20 @@ interface SetupStatus {
   ffmpegInstallCommand?: string;
   micDevices?: AudioInputDevice[];
   micDeviceId?: string;
+  speakerDevices?: AudioOutputDevice[];
+  speakerDeviceId?: string;
+  speakerError?: string;
   voiceName?: string;
   voiceOptions?: VoiceOption[];
   liveModel?: string;
   liveModelOptions?: LiveModelOption[];
   speakResponses?: boolean;
+}
+
+interface AudioOutputDevice {
+  id: string;
+  label: string;
+  isDefault?: boolean;
 }
 
 interface VoiceOption {
@@ -67,6 +76,10 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
   const [installCommand, setInstallCommand] = useState('');
   const [micDevices, setMicDevices] = useState<AudioInputDevice[]>([]);
   const [selectedMicId, setSelectedMicId] = useState('');
+
+  const [speakerDevices, setSpeakerDevices] = useState<AudioOutputDevice[]>([]);
+  const [speakerDeviceId, setSpeakerDeviceId] = useState('');
+  const [speakerError, setSpeakerError] = useState('');
 
   const [voiceName, setVoiceName] = useState('');
   const [voiceOptions, setVoiceOptions] = useState<VoiceOption[]>([]);
@@ -110,6 +123,10 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
       setInstallCommand(payload.ffmpegInstallCommand ?? '');
       setMicDevices(payload.micDevices ?? []);
       setSelectedMicId(payload.micDeviceId ?? '');
+
+      setSpeakerDevices(payload.speakerDevices ?? []);
+      setSpeakerDeviceId(payload.speakerDeviceId ?? '');
+      setSpeakerError(payload.speakerError ?? '');
 
       setVoiceName(payload.voiceName ?? '');
       setVoiceOptions(payload.voiceOptions ?? []);
@@ -160,6 +177,11 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
   function handleSpeakToggle(enabled: boolean) {
     setSpeakResponses(enabled);
     postToExtension({ type: 'SET_SPEAK_RESPONSES', payload: { enabled } });
+  }
+
+  function handleSpeakerSelect(deviceId: string) {
+    setSpeakerDeviceId(deviceId);
+    postToExtension({ type: 'SET_SPEAKER_DEVICE', payload: { deviceId } });
   }
 
   /**
@@ -312,6 +334,32 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
                 </p>
               )}
 
+              {speakerDevices.length > 0 ? (
+                <div className="setup-mic-select-wrap">
+                  <label className="setup-mic-select-label" htmlFor="setup-speaker-select">
+                    Output device
+                  </label>
+                  <select
+                    id="setup-speaker-select"
+                    className="setup-select"
+                    value={speakerDeviceId}
+                    onChange={(e) => handleSpeakerSelect(e.target.value)}
+                  >
+                    {speakerDevices.map((dev, i) => (
+                      <option key={dev.id} value={dev.id}>
+                        {dev.label || `Output ${i + 1}`}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              ) : (
+                <p className="setup-card-hint">
+                  Output device selection is unavailable here, so Tara plays through the panel and
+                  your system default.
+                  {speakerError ? ` (${speakerError})` : ''}
+                </p>
+              )}
+
               <label className="setup-toggle" htmlFor="setup-speak-toggle">
                 <input
                   id="setup-speak-toggle"
@@ -319,7 +367,7 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
                   checked={speakResponses}
                   onChange={(e) => handleSpeakToggle(e.target.checked)}
                 />
-                <span>Read questions and warnings aloud</span>
+                <span>Speak answers, questions and warnings aloud</span>
               </label>
 
               <p className="setup-card-hint">

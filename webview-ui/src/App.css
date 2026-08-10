@@ -698,12 +698,25 @@ body::before {
   to   { opacity: 1; transform: translateY(0); }
 }
 
+/* Sent messages sit on the right, replies on the left — the arrangement every
+   chat client uses, so who said what is readable without reading the label.
+   `.tara-chat` is a flex column, which is what makes align-self work here. */
 .bubble-user {
+  align-self: flex-end;
+  max-width: 85%;
   background: var(--bubble-user-bg);
-  border-color: var(--border);
-  border-left: 2px solid var(--bubble-user-border);
-  margin-left: var(--sp-4);
-  border-radius: 0 var(--r-md) var(--r-md) 0;
+  border-color: var(--bubble-user-border);
+  /* Square corner on the bottom right: the bubble's "tail", pointing at the
+     input box the message came from. */
+  border-radius: var(--r-md) var(--r-md) 2px var(--r-md);
+}
+
+.bubble-claude,
+.bubble-tara {
+  align-self: flex-start;
+  max-width: 92%;
+  /* Mirrored tail, so the two sides read as a conversation. */
+  border-radius: var(--r-md) var(--r-md) var(--r-md) 2px;
 }
 
 .bubble-claude {
@@ -716,11 +729,25 @@ body::before {
   border-color: var(--bubble-tara-border);
 }
 
+/* The header is label-then-time with the time pushed right by margin-left:auto.
+   On a right-aligned bubble that reads backwards, so the row is reversed and the
+   auto margin flips with it. */
+.bubble-user .bubble-header {
+  flex-direction: row-reverse;
+}
+
+.bubble-user .bubble-time {
+  margin-left: 0;
+  margin-right: auto;
+}
+
 .bubble-system {
+  align-self: center;
   background: transparent;
   border: none;
   padding: 2px var(--sp-2);
   align-items: center;
+  text-align: center;
 }
 
 .bubble-system-text {

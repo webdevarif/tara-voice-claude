@@ -155,7 +155,7 @@
         "tara.speakResponses": {
           "type": "boolean",
           "default": true,
-          "description": "Read clarifying questions and warnings aloud."
+          "description": "Speak agent answers, clarifying questions and warnings aloud."
         },
         "tara.voiceMode": {
           "type": "string",
@@ -213,6 +213,7 @@
   },
   "dependencies": {
     "@picovoice/pvrecorder-node": "^1.2.9",
+    "@picovoice/pvspeaker-node": "^1.0.3",
     "ws": "^8.17.0"
   }
 }
