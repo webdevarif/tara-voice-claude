@@ -160,10 +160,14 @@
         "tara.voiceMode": {
           "type": "string",
           "enum": [
-            "push-to-talk",
+            "hands-free",
             "disabled"
           ],
-          "default": "push-to-talk",
+          "enumDescriptions": [
+            "Click the orb to listen continuously. Audio is only sent while you are actually speaking; after 15s of silence Tara sleeps until it hears \"wake up\".",
+            "No voice input at all."
+          ],
+          "default": "hands-free",
           "description": "Voice input mode."
         },
         "tara.riskConfirmation": {

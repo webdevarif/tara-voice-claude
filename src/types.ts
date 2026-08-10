@@ -18,8 +18,7 @@ export interface TaraMessage {
 export type TaraMessageType =
   // Webview → Extension
   | 'WEBVIEW_READY'           // webview has subscribed and wants its initial state
-  | 'VOICE_START'             // user pressed push-to-talk
-  | 'VOICE_STOP'              // user released push-to-talk
+  | 'SET_MIC_ENABLED'         // user switched hands-free listening on or off
   | 'SEND_COMMAND'            // text command submitted from chat input
   | 'REPLY_TO_AGENT'          // answer to a clarifying question from an agent
   | 'STOP_AGENT'              // user clicked stop
@@ -37,6 +36,7 @@ export type TaraMessageType =
   | 'INSTALL_FFMPEG'          // webview asks for the ffmpeg install command in a terminal
   | 'SETUP_COMPLETE'          // webview reports setup finished; persist it
   // Extension → Webview
+  | 'USER_MESSAGE'            // a user entry the host recorded (typed or dictated)
   | 'TRANSCRIPT_TOKEN'        // streaming STT token
   | 'TRANSCRIPT_DONE'         // full transcript finalized
   | 'AGENT_OUTPUT'            // streaming Claude output line

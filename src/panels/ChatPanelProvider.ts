@@ -16,6 +16,7 @@ import {
   probeCapture,
 } from '../voice/MicRecorder';
 import { verifyGeminiKey } from '../voice/GeminiKeyCheck';
+import { Vad } from '../voice/Vad';
 import {
   AudioOutputDevice,
   SpeakerPlayer,
@@ -98,14 +99,13 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   private history: ChatEntry[] = [];
   private pendingConfirmation?: { prompt: string; replyToAgentId?: string };
   private viewDisposables: vscode.Disposable[] = [];
-  /**
-   * Set when VOICE_STOP arrives while VOICE_START is still awaiting the bridge.
-   * Without it, the stop hits an undefined bridge and is lost, leaving the
-   * session listening forever and never finalizing the utterance.
-   */
-  private voiceStopPending = false;
   /** Microphone capture, in this process rather than the webview. */
   private readonly recorder = new MicRecorder();
+  /**
+   * Local speech gate. With the microphone open continuously, this is what keeps
+   * a silent room from being streamed to — and billed by — the Live API.
+   */
+  private readonly vad = new Vad();
   /** Playback, also in this process — see SpeakerPlayer's header for why. */
   private readonly speaker = new SpeakerPlayer();
   /** Cached from the last setup check so a press does not re-probe. */
@@ -119,22 +119,17 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     private readonly context: vscode.ExtensionContext,
     private readonly orchestrator: AgentOrchestrator
   ) {
-    // ffmpeg's stdout is already 16 kHz s16le mono — the exact wire format —
-    // so this is a base64 wrap and nothing more.
-    this.recorder.on('data', (chunk: Buffer) => {
-      this.bytesThisUtterance += chunk.length;
-      this.voiceBridge?.sendAudioChunk(chunk.toString('base64'));
-    });
-    // Opening a dshow graph takes ~450 ms, so "listening" is only true once the
-    // first sample actually lands. Claiming it earlier trains users to start
-    // talking into a device that is not open yet.
-    this.recorder.on('capturing', () => {
-      this.postMessage({ type: 'VOICE_STATE', payload: { mic: 'capturing' } });
-    });
+    // Every chunk is examined locally; only some of them are sent on.
+    this.recorder.on('data', (chunk: Buffer) => this.handleAudioChunk(chunk));
+    this.recorder.on('capturing', () => this.postMicState());
     this.recorder.on('error', (message: string) => {
-      this.postMessage({ type: 'VOICE_STATE', payload: { mic: 'idle' } });
+      this.micEnabled = false;
+      this.postMicState();
       this.postMessage({ type: 'ERROR', payload: { message } });
     });
+
+    this.vad.on('speechStart', () => void this.onSpeechStart());
+    this.vad.on('speechEnd', () => void this.onSpeechEnd());
 
     // Wired once, in the constructor. Doing this in resolveWebviewView would add
     // a duplicate listener every time the view is recreated.
@@ -398,8 +393,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       this.postMessage({ type: 'TRANSCRIPT_TOKEN', payload: { token: text } });
     });
     bridge.on('transcriptDone', (transcript: string) => {
-      this.postMessage({ type: 'TRANSCRIPT_DONE', payload: { transcript } });
-      void this.submitUserText(transcript);
+      // Routed rather than dispatched: while asleep a transcript is only a wake
+      // check, and must not reach an agent.
+      void this.handleTranscript(transcript);
     });
     bridge.on('ttsChunk', (base64: string) => {
       // Played here when the bundled output module is available, so the user can
@@ -412,6 +408,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       }
     });
     bridge.on('ttsDone', () => {
+      // Releases anything still under the prebuffer threshold; a reply shorter
+      // than 250 ms would otherwise sit in the queue and never play.
+      this.speaker.endOfStream();
       this.postMessage({ type: 'TTS_DONE', payload: {} });
     });
     bridge.on('error', (message: string) => {
@@ -519,14 +518,76 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     return this.micDevices[0]?.id;
   }
 
-  private async startCapture() {
-    this.voiceStopPending = false;
-    this.bytesThisUtterance = 0;
-    this.postMessage({ type: 'VOICE_STATE', payload: { mic: 'opening' } });
+  // ── Hands-free session ─────────────────────────────────────────────────────
+  //
+  // The microphone stays open for as long as it is switched on. What it does
+  // *not* do is stay connected: audio is only streamed to Gemini between a local
+  // speech-start and speech-end, so a silent room costs nothing. After
+  // SLEEP_AFTER_MS with nothing said, it stops listening for commands at all and
+  // waits for the wake phrase — which still costs one short turn per burst of
+  // speech near the mic, but only per burst.
+
+  private static readonly SLEEP_AFTER_MS = 15000;
+  /** A wake phrase is short; anything longer is someone talking about something else. */
+  private static readonly WAKE_BURST_LIMIT_MS = 4000;
+  private static readonly WAKE_PHRASE = /\bwake\s*up\b/i;
+  /**
+   * Audio kept from just before speech was declared. The gate needs a few frames
+   * to be sure, so without this the turn opens after the first syllable and the
+   * transcript loses the start of the sentence — fatal for a two-word wake
+   * phrase.
+   */
+  private static readonly PREROLL_BYTES = 16000 * 2 * 0.3;
+
+  private micEnabled = false;
+  private awake = true;
+  /** A Gemini turn is open and chunks are being forwarded. */
+  private streaming = false;
+  /** The open turn is a wake-phrase probe, so its transcript is not a command. */
+  private wakeProbe = false;
+  private sleepTimer?: NodeJS.Timeout;
+  private burstTimer?: NodeJS.Timeout;
+  private preroll: Buffer[] = [];
+  private prerollBytes = 0;
+
+  private micState(): 'off' | 'listening' | 'hearing' | 'asleep' {
+    if (!this.micEnabled) {
+      return 'off';
+    }
+    if (!this.awake) {
+      return 'asleep';
+    }
+    return this.streaming ? 'hearing' : 'listening';
+  }
+
+  private postMicState() {
+    this.postMessage({ type: 'VOICE_STATE', payload: { mic: this.micState() } });
+  }
+
+  /** Switched from the orb. Idempotent, so a double click cannot open two devices. */
+  async setMicEnabled(enabled: boolean): Promise<void> {
+    if (this.voiceDisabled() && enabled) {
+      this.addSystemMessage('Voice input is disabled — set "tara.voiceMode" to enable it.');
+      return;
+    }
+    if (enabled === this.micEnabled) {
+      return;
+    }
+
+    if (!enabled) {
+      this.micEnabled = false;
+      this.clearTimers();
+      await this.endTurn();
+      await this.recorder.stop();
+      this.vad.reset();
+      this.preroll = [];
+      this.prerollBytes = 0;
+      this.postMicState();
+      return;
+    }
 
     const deviceId = await this.resolveMicDevice();
     if (!deviceId) {
-      this.postMessage({ type: 'VOICE_STATE', payload: { mic: 'idle' } });
       this.postMessage({
         type: 'ERROR',
         payload: {
@@ -538,62 +599,164 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    const bridge = await this.getOrCreateVoiceBridge();
-    if (!bridge) {
-      this.postMessage({ type: 'VOICE_STATE', payload: { mic: 'idle' } });
-      return;
-    }
+    this.vad.reset();
+    this.awake = true;
+    this.micEnabled = true;
+    this.postMicState();
 
-    // Arming the turn and opening the device are independent, and the device is
-    // the slow one (~450 ms). Serialising them would add the socket round-trip
-    // on top of that for no reason; chunks that beat the socket open are
-    // buffered by the bridge.
     try {
-      await Promise.all([bridge.startListening(), this.recorder.start(this.ffmpegPath(), deviceId)]);
+      await this.recorder.start(this.ffmpegPath(), deviceId);
     } catch (err) {
-      this.postMessage({ type: 'VOICE_STATE', payload: { mic: 'idle' } });
+      this.micEnabled = false;
+      this.postMicState();
       this.postMessage({
         type: 'ERROR',
         payload: {
           message: err instanceof Error ? err.message : 'Could not start the microphone.',
         },
       });
-      await this.recorder.stop();
       return;
     }
+    this.armSleepTimer();
+  }
 
-    // The release can land while the device is still opening.
-    if (this.voiceStopPending) {
-      this.voiceStopPending = false;
-      await this.stopCapture();
+  /** Every captured chunk passes through here, whether or not it is sent on. */
+  private handleAudioChunk(chunk: Buffer) {
+    if (!this.micEnabled) {
+      return;
+    }
+    if (this.streaming) {
+      this.bytesThisUtterance += chunk.length;
+      this.voiceBridge?.sendAudioChunk(chunk.toString('base64'));
+    } else {
+      this.rememberPreroll(chunk);
+    }
+    // Pushed last: a speechStart raised inside this call opens the turn, and the
+    // preroll it flushes should already contain this chunk.
+    this.vad.push(chunk);
+  }
+
+  private rememberPreroll(chunk: Buffer) {
+    this.preroll.push(chunk);
+    this.prerollBytes += chunk.length;
+    while (this.prerollBytes > ChatPanelProvider.PREROLL_BYTES && this.preroll.length > 1) {
+      this.prerollBytes -= this.preroll.shift()!.length;
     }
   }
 
-  private async stopCapture() {
-    if (!this.recorder.active && !this.voiceBridge) {
-      // Nothing is running yet — remember the release so startCapture honours it.
-      this.voiceStopPending = true;
+  private async onSpeechStart() {
+    if (!this.micEnabled || this.streaming) {
+      return;
+    }
+    this.clearTimers();
+
+    const bridge = await this.getOrCreateVoiceBridge();
+    if (!bridge) {
       return;
     }
 
-    // Read before stopping: stop() clears it.
-    const backend = this.recorder.activeBackend;
-    // Stop the device first and wait for it to exit, so `audioStreamEnd` cannot
-    // race ahead of the last chunks and truncate the utterance server-side.
-    await this.recorder.stop();
-    this.postMessage({ type: 'VOICE_STATE', payload: { mic: 'idle' } });
-    this.voiceBridge?.stopListening();
+    this.wakeProbe = !this.awake;
+    this.streaming = true;
+    this.bytesThisUtterance = 0;
+    this.postMicState();
 
-    if (this.bytesThisUtterance === 0) {
-      // Released before the device delivered anything. The bundled backend opens
-      // in ~60 ms so this is a genuinely instant tap; ffmpeg needs ~450 ms, which
-      // is easy to beat by accident, so the advice differs.
-      this.addSystemMessage(
-        backend === 'ffmpeg'
-          ? 'No audio was captured — this backend takes about half a second to open the microphone. Hold the button until the indicator says "Listening", then speak.'
-          : 'No audio was captured — the button was released before the microphone delivered anything. Hold it while you speak.'
-      );
+    await bridge.startListening();
+    if (!this.streaming) {
+      // Speech ended while the socket was still coming up.
+      return;
     }
+    for (const chunk of this.preroll) {
+      bridge.sendAudioChunk(chunk.toString('base64'));
+    }
+    this.preroll = [];
+    this.prerollBytes = 0;
+
+    if (this.wakeProbe) {
+      // Bound the probe: listening indefinitely to a conversation that is not
+      // addressed to us is exactly what sleeping is supposed to prevent.
+      this.burstTimer = setTimeout(() => {
+        void this.endTurn();
+      }, ChatPanelProvider.WAKE_BURST_LIMIT_MS);
+    }
+  }
+
+  private async onSpeechEnd() {
+    if (!this.streaming) {
+      return;
+    }
+    await this.endTurn();
+    if (this.micEnabled && this.awake) {
+      this.armSleepTimer();
+    }
+  }
+
+  /** Closes the Gemini turn, if one is open. The transcript arrives afterwards. */
+  private async endTurn() {
+    if (this.burstTimer) {
+      clearTimeout(this.burstTimer);
+      this.burstTimer = undefined;
+    }
+    if (!this.streaming) {
+      return;
+    }
+    this.streaming = false;
+    this.voiceBridge?.stopListening();
+    this.postMicState();
+  }
+
+  private armSleepTimer() {
+    this.clearSleepTimer();
+    this.sleepTimer = setTimeout(() => {
+      this.sleepTimer = undefined;
+      if (!this.micEnabled || !this.awake) {
+        return;
+      }
+      this.awake = false;
+      this.postMicState();
+      this.addSystemMessage('Gone quiet after 15s — say "wake up" to start again.');
+    }, ChatPanelProvider.SLEEP_AFTER_MS);
+  }
+
+  private clearSleepTimer() {
+    if (this.sleepTimer) {
+      clearTimeout(this.sleepTimer);
+      this.sleepTimer = undefined;
+    }
+  }
+
+  private clearTimers() {
+    this.clearSleepTimer();
+    if (this.burstTimer) {
+      clearTimeout(this.burstTimer);
+      this.burstTimer = undefined;
+    }
+  }
+
+  /**
+   * A finished transcript. While asleep it is only ever tested against the wake
+   * phrase and then discarded — nothing said to someone else in the room should
+   * reach an agent.
+   */
+  private async handleTranscript(transcript: string) {
+    const text = transcript.trim();
+
+    if (this.wakeProbe) {
+      this.wakeProbe = false;
+      if (ChatPanelProvider.WAKE_PHRASE.test(text)) {
+        this.awake = true;
+        this.speaker.playChime();
+        this.postMicState();
+        this.addSystemMessage('Awake — go ahead.');
+        this.armSleepTimer();
+      }
+      return;
+    }
+
+    if (!text) {
+      return;
+    }
+    this.postMessage({ type: 'TRANSCRIPT_DONE', payload: { transcript: text } });
+    await this.submitUserText(text);
   }
 
   // ── Message handling ───────────────────────────────────────────────────────
@@ -607,17 +770,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         break;
       }
 
-      case 'VOICE_START': {
-        if (this.voiceDisabled()) {
-          this.addSystemMessage('Voice input is disabled — set "tara.voiceMode" to enable it.');
-          break;
-        }
-        await this.startCapture();
-        break;
-      }
-
-      case 'VOICE_STOP': {
-        await this.stopCapture();
+      case 'SET_MIC_ENABLED': {
+        const { enabled } = msg.payload as { enabled?: boolean };
+        await this.setMicEnabled(!!enabled);
         break;
       }
 
@@ -772,14 +927,24 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   }
 
   private addEntry(role: ChatEntry['role'], content: string) {
-    this.history.push({
+    const entry: ChatEntry = {
       id: `${role}-${Date.now()}-${this.history.length}`,
       role,
       content,
       timestamp: Date.now(),
-    });
+    };
+    this.history.push(entry);
     if (this.history.length > MAX_HISTORY_ENTRIES) {
       this.history.splice(0, this.history.length - MAX_HISTORY_ENTRIES);
+    }
+
+    // Only `user` is echoed. This used to post nothing at all, which is why a
+    // dictated command never appeared on screen: typed input showed up solely
+    // because the webview drew its own optimistic copy, and a transcript has no
+    // such local origin. Claude and system entries already reach the webview via
+    // AGENT_OUTPUT, so echoing those here would render them twice.
+    if (role === 'user') {
+      this.postMessage({ type: 'USER_MESSAGE', payload: { entry } });
     }
   }
 

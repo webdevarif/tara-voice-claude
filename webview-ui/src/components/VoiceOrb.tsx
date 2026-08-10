@@ -1,16 +1,16 @@
 import { useEffect, useRef, useState } from 'react';
 
-export type MicState = 'idle' | 'opening' | 'capturing';
+/**
+ * Four states, not two, because "the microphone is on" and "you are being heard"
+ * are different facts, and conflating them is what makes hands-free listening
+ * feel broken — you cannot tell whether it is your turn.
+ */
+export type MicState = 'off' | 'listening' | 'hearing' | 'asleep';
 
 interface VoiceOrbProps {
-  /**
-   * 'opening' is the ~450 ms a capture device takes to start delivering
-   * samples. It gets its own visual because the difference matters: speaking
-   * during it records nothing.
-   */
   micState: MicState;
-  onStart: () => void;
-  onEnd: () => void;
+  /** A click switches listening on or off. There is no hold. */
+  onToggle: () => void;
 }
 
 const NUM_BARS = 32;
@@ -19,20 +19,35 @@ const BAR_MIN = 4;
 const BAR_MAX = 22;
 const CENTER = 80;        // SVG viewBox center
 
-export function VoiceOrb({ micState, onStart, onEnd }: VoiceOrbProps) {
+const LABEL: Record<MicState, string> = {
+  off: 'Click to talk',
+  listening: 'Listening',
+  hearing: 'Hearing you…',
+  asleep: 'Asleep — say "wake up"',
+};
+
+const TITLE: Record<MicState, string> = {
+  off: 'Start listening',
+  listening: 'Listening — click to stop',
+  hearing: 'Picking up your voice',
+  asleep: 'Sleeping after 15s of silence — say "wake up", or click to stop',
+};
+
+export function VoiceOrb({ micState, onToggle }: VoiceOrbProps) {
   const [bars, setBars] = useState<number[]>(Array(NUM_BARS).fill(BAR_MIN));
   const animFrameRef = useRef<number>(0);
-  const holdRef = useRef(false);
-  const isListening = micState === 'capturing';
+  const live = micState === 'hearing';
+  const on = micState !== 'off';
 
   // ── Bar animation ─────────────────────────────────────────────────────────
-  // There is no AnalyserNode to drive this any more: the samples never enter
-  // this document, they go from ffmpeg straight to the Gemini socket in the
+  // There is no AnalyserNode to drive this: the samples never enter this
+  // document, they go from the recorder straight to the Gemini socket in the
   // extension host. So the bars are synthetic, and only their tempo carries
-  // meaning — lively for capturing, muted for opening, near-still for idle.
+  // meaning — lively while speech is being heard, slow while merely listening,
+  // barely moving while asleep or off.
   useEffect(() => {
-    const speed = isListening ? 0.08 : micState === 'opening' ? 0.05 : 0.04;
-    const depth = isListening ? 1 : micState === 'opening' ? 0.35 : 0;
+    const speed = live ? 0.08 : micState === 'listening' ? 0.05 : 0.03;
+    const depth = live ? 1 : micState === 'listening' ? 0.3 : 0;
     let t = 0;
     const tick = () => {
       t += speed;
@@ -53,21 +68,20 @@ export function VoiceOrb({ micState, onStart, onEnd }: VoiceOrbProps) {
     };
     animFrameRef.current = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(animFrameRef.current!);
-  }, [isListening, micState]);
+  }, [live, micState]);
 
-  // ── Pointer handlers ──────────────────────────────────────────────────────
-  function handlePointerDown(e: React.PointerEvent) {
-    e.preventDefault();
-    if (holdRef.current) return;
-    holdRef.current = true;
-    onStart();
-  }
-
-  function handlePointerUp() {
-    if (!holdRef.current) return;
-    holdRef.current = false;
-    onEnd();
-  }
+  // Asleep is "on but not paying attention", so it reads as active-but-dimmed
+  // rather than off, which would suggest a click is needed to resume.
+  const accent = live
+    ? '#5b5fc7'
+    : micState === 'listening'
+      ? '#4a4ea8'
+      : on
+        ? '#33365e'
+        : '#2e3045';
+  const coreFill = live ? '#5b5fc7' : on ? '#1b1d2c' : '#111318';
+  const strokeCol = live ? '#7b7fd4' : on ? '#3a3d7a' : '#252730';
+  const iconCol = live ? '#fff' : on ? '#b9bce0' : '#6b6e8a';
 
   // ── Build SVG bars arranged in a circle ───────────────────────────────────
   const barEls = bars.map((h, i) => {
@@ -86,8 +100,8 @@ export function VoiceOrb({ micState, onStart, onEnd }: VoiceOrbProps) {
         height={h}
         rx={1.5}
         transform={`rotate(${angle + 90}, ${x}, ${y})`}
-        fill={isListening ? '#5b5fc7' : '#2e3045'}
-        opacity={isListening ? 0.9 : 0.5}
+        fill={accent}
+        opacity={on ? 0.9 : 0.5}
         style={{ transition: 'fill 0.4s ease, opacity 0.4s ease' }}
       />
     );
@@ -97,26 +111,12 @@ export function VoiceOrb({ micState, onStart, onEnd }: VoiceOrbProps) {
     <div className="voice-orb-wrapper">
       <button
         id="tara-voice-btn"
-        className={`voice-orb-btn ${isListening ? 'listening' : ''}`}
-        onPointerDown={handlePointerDown}
-        onPointerUp={handlePointerUp}
-        onPointerLeave={handlePointerUp}
+        className={`voice-orb-btn ${live ? 'listening' : ''} ${on ? 'mic-on' : ''}`}
+        onClick={onToggle}
         onContextMenu={(e) => e.preventDefault()}
-        title={
-          micState === 'capturing'
-            ? 'Release to send'
-            : micState === 'opening'
-              ? 'Opening the microphone — wait for "Listening" before speaking'
-              : 'Hold to speak'
-        }
-        aria-label={
-          micState === 'capturing'
-            ? 'Recording — release to send'
-            : micState === 'opening'
-              ? 'Opening the microphone'
-              : 'Hold to speak'
-        }
-        aria-pressed={micState !== 'idle'}
+        title={TITLE[micState]}
+        aria-label={TITLE[micState]}
+        aria-pressed={on}
       >
         {/* Circular EQ bars */}
         <svg
@@ -130,7 +130,7 @@ export function VoiceOrb({ micState, onStart, onEnd }: VoiceOrbProps) {
             cy={CENTER}
             r={ORB_RADIUS - 2}
             fill="none"
-            stroke={isListening ? '#5b5fc7' : '#22242e'}
+            stroke={on ? accent : '#22242e'}
             strokeWidth="1"
             strokeDasharray="4 6"
             className="orb-ring-1"
@@ -141,7 +141,7 @@ export function VoiceOrb({ micState, onStart, onEnd }: VoiceOrbProps) {
             cy={CENTER}
             r={ORB_RADIUS + 12}
             fill="none"
-            stroke={isListening ? '#3a3d7a' : '#1a1c26'}
+            stroke={on ? '#3a3d7a' : '#1a1c26'}
             strokeWidth="1"
             strokeDasharray="2 8"
             className="orb-ring-2"
@@ -156,46 +156,48 @@ export function VoiceOrb({ micState, onStart, onEnd }: VoiceOrbProps) {
             cx={CENTER}
             cy={CENTER}
             r={28}
-            fill={isListening ? '#5b5fc7' : '#111318'}
-            stroke={isListening ? '#7b7fd4' : '#252730'}
+            fill={coreFill}
+            stroke={strokeCol}
             strokeWidth="1"
-            className={isListening ? 'orb-core-pulse' : ''}
+            className={live ? 'orb-core-pulse' : ''}
             style={{ transition: 'fill 0.3s ease, stroke 0.3s ease' }}
           />
 
           {/* Mic icon in center */}
           <g transform={`translate(${CENTER - 8}, ${CENTER - 11})`}>
             <rect x="5" y="0" width="6" height="10" rx="3"
-              fill="none" stroke={isListening ? '#fff' : '#6b6e8a'}
+              fill="none" stroke={iconCol}
               strokeWidth="1.5"
               style={{ transition: 'stroke 0.3s ease' }}
             />
             <path d="M2 7a6 6 0 0 0 12 0"
-              fill="none" stroke={isListening ? '#fff' : '#6b6e8a'}
+              fill="none" stroke={iconCol}
               strokeWidth="1.5" strokeLinecap="round"
               style={{ transition: 'stroke 0.3s ease' }}
             />
             <line x1="8" y1="13" x2="8" y2="16"
-              stroke={isListening ? '#fff' : '#6b6e8a'}
+              stroke={iconCol}
               strokeWidth="1.5" strokeLinecap="round"
               style={{ transition: 'stroke 0.3s ease' }}
             />
             <line x1="5" y1="16" x2="11" y2="16"
-              stroke={isListening ? '#fff' : '#6b6e8a'}
+              stroke={iconCol}
               strokeWidth="1.5" strokeLinecap="round"
               style={{ transition: 'stroke 0.3s ease' }}
             />
+            {micState === 'asleep' && (
+              // A slash across the mic: sleeping is not the same as off, but it
+              // is also not listening for commands, and the label alone is easy
+              // to miss.
+              <line x1="1" y1="1" x2="15" y2="17"
+                stroke={iconCol} strokeWidth="1.5" strokeLinecap="round" opacity="0.8"
+              />
+            )}
           </g>
         </svg>
 
         {/* Label */}
-        <span className="voice-orb-label">
-          {micState === 'capturing'
-            ? 'Listening…'
-            : micState === 'opening'
-              ? 'Opening mic…'
-              : 'Hold to speak'}
-        </span>
+        <span className="voice-orb-label">{LABEL[micState]}</span>
       </button>
     </div>
   );

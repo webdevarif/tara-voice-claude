@@ -3,6 +3,7 @@ import { postToExtension, onExtensionMessage } from './vscode-api';
 import { PcmPlayer } from './audio';
 import { SetupScreen } from './components/SetupScreen';
 import { VoiceOrb } from './components/VoiceOrb';
+import type { MicState } from './components/VoiceOrb';
 import { ChatBubble } from './components/ChatBubble';
 import { StatusIndicator } from './components/StatusIndicator';
 import { ConfirmDialog } from './components/ConfirmDialog';
@@ -36,11 +37,11 @@ export default function App() {
   const [pendingQuestion, setPendingQuestion] = useState<PendingQuestion | null>(null);
   const [transcriptDraft, setTranscriptDraft] = useState('');
   /**
-   * 'opening' covers the ~450 ms a capture device takes to start delivering
-   * samples. The UI must not claim to be listening during it, or users start
-   * talking before anything is being recorded.
+   * Owned by the extension host, which is where the microphone actually lives —
+   * this only mirrors what it reports, so the orb can never claim to be
+   * listening when the device is not open.
    */
-  const [micState, setMicState] = useState<'idle' | 'opening' | 'capturing'>('idle');
+  const [micState, setMicState] = useState<MicState>('off');
   const [confirmRequest, setConfirmRequest] = useState<{ message: string } | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -49,10 +50,10 @@ export default function App() {
   const streamingByAgentRef = useRef<Map<string, string>>(new Map());
   const playerRef = useRef<PcmPlayer | null>(null);
   // Read inside callbacks that must not be re-created on every state change.
-  const micStateRef = useRef<'idle' | 'opening' | 'capturing'>('idle');
+  const micStateRef = useRef<MicState>('off');
 
   micStateRef.current = micState;
-  const isListening = micState === 'capturing';
+  // Derived where needed; the orb owns the rest of the presentation.
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -129,22 +130,15 @@ export default function App() {
   // and `micState` comes back from the host — 'opening' until the capture device
   // is actually delivering samples, which takes ~450 ms.
 
-  const handleVoiceStart = useCallback(() => {
-    if (micStateRef.current !== 'idle') {
-      return;
-    }
-    setMicState('opening');
-    postToExtension({ type: 'VOICE_START', payload: {} });
-  }, []);
-
-  const handleVoiceEnd = useCallback(() => {
-    if (micStateRef.current === 'idle') {
-      return;
-    }
-    // Optimistic, so the button releases instantly; the host confirms with its
-    // own 'idle' once ffmpeg has exited.
-    setMicState('idle');
-    postToExtension({ type: 'VOICE_STOP', payload: {} });
+  /**
+   * One switch, not a hold. The host owns the real state and will correct this
+   * on its next VOICE_STATE; setting it here only keeps the click from feeling
+   * unresponsive while the device opens.
+   */
+  const handleToggleMic = useCallback(() => {
+    const enabled = micStateRef.current === 'off';
+    setMicState(enabled ? 'listening' : 'off');
+    postToExtension({ type: 'SET_MIC_ENABLED', payload: { enabled } });
   }, []);
 
   // ── Extension messages ────────────────────────────────────────────────────
@@ -214,7 +208,7 @@ export default function App() {
             action?: string;
           };
           if (payload.action === 'triggerVoice') {
-            void handleVoiceStart();
+            handleToggleMic();
           }
           if (payload.status) {
             setAgentStatus(payload.status);
@@ -245,13 +239,21 @@ export default function App() {
         case 'TTS_DONE':
           break;
 
+        case 'USER_MESSAGE': {
+          // The host is the single source of truth for what the user said —
+          // typed input used to be drawn locally and dictated input not at all,
+          // which is why a spoken command never appeared.
+          const { entry } = msg.payload as { entry: ChatEntry };
+          if (entry) {
+            setHistory((h) => [...h, entry]);
+          }
+          break;
+        }
+
         case 'VOICE_STATE': {
           // Two independent things arrive on this channel: `state` is the Gemini
           // session, `mic` is the capture device. A frame carries either.
-          const { state, mic } = msg.payload as {
-            state?: string;
-            mic?: 'idle' | 'opening' | 'capturing';
-          };
+          const { state, mic } = msg.payload as { state?: string; mic?: MicState };
           if (state === 'error' || state === 'idle') {
             setTranscriptDraft('');
           }
@@ -292,7 +294,7 @@ export default function App() {
       clearTimeout(initFallback);
       cleanup();
     };
-  }, [appendMessage, appendStreamingMessage, closeStreamingMessage, handleVoiceStart]);
+  }, [appendMessage, appendStreamingMessage, closeStreamingMessage, handleToggleMic]);
 
   // ── Text submit ───────────────────────────────────────────────────────────
 
@@ -303,7 +305,8 @@ export default function App() {
       return;
     }
     setTextInput('');
-    appendMessage({ role: 'user', content: text });
+    // Not drawn here: the host echoes it back as USER_MESSAGE, which is also the
+    // path a dictated command takes. Drawing it locally as well would double it.
 
     if (pendingQuestion) {
       postToExtension({
@@ -408,11 +411,7 @@ export default function App() {
         />
       )}
 
-      <VoiceOrb
-        micState={micState}
-        onStart={handleVoiceStart}
-        onEnd={handleVoiceEnd}
-      />
+      <VoiceOrb micState={micState} onToggle={handleToggleMic} />
 
       <div className="tara-input-bar">
         <form className="tara-text-form" onSubmit={handleSubmit}>
@@ -424,20 +423,20 @@ export default function App() {
             placeholder={
               pendingQuestion
                 ? 'Answer Tara…'
-                : micState === 'capturing'
+                : micState === 'hearing'
                   ? 'Listening…'
-                  : micState === 'opening'
-                    ? 'Opening microphone…'
-                    : 'or type a command…'
+                  : 'or type a command…'
             }
-            disabled={micState !== 'idle'}
+            // Typing stays available while the mic is on: hands-free listening
+            // is not a mode you have to leave to use the keyboard.
+            disabled={micState === 'hearing'}
             autoComplete="off"
           />
           <button
             id="tara-submit-btn"
             type="submit"
             className="tara-submit-btn"
-            disabled={!textInput.trim() || isListening}
+            disabled={!textInput.trim() || micState === 'hearing'}
             aria-label={pendingQuestion ? 'Send answer' : 'Send'}
           >
             ↑

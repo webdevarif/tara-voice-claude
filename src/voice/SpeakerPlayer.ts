@@ -40,6 +40,17 @@ const BYTES_PER_SAMPLE = BITS_PER_SAMPLE / 8;
  */
 const BUFFER_SIZE_SECS = 5;
 
+/**
+ * Audio to bank before the first sample is handed over, in bytes — 250 ms.
+ *
+ * The device consumes in real time from the moment it starts. Gemini's audio
+ * arrives over a socket in bursts that are sometimes slower than real time, so
+ * writing the first chunk immediately meant the device caught up with the
+ * stream and underran, once per gap. That is exactly the "choppy, and sometimes
+ * nothing" symptom. Banking a quarter second first gives the network that slack.
+ */
+const PREBUFFER_BYTES = OUTPUT_SAMPLE_RATE * BYTES_PER_SAMPLE * 0.25;
+
 /** How long to wait before retrying a write the device buffer could not take. */
 const BACKPRESSURE_RETRY_MS = 40;
 
@@ -126,6 +137,34 @@ export function probeSpeakers(): SpeakerProbe {
   }
 }
 
+/**
+ * A short rising two-tone chime, as playable PCM. Synthesised rather than
+ * shipped as an asset, and rather than asked of the model: it costs nothing,
+ * needs no round trip, and so can sound the instant the wake word lands.
+ */
+export function chimePcm(): Buffer {
+  const notes = [
+    { freq: 660, ms: 90 },
+    { freq: 990, ms: 130 },
+  ];
+  const total = notes.reduce((n, x) => n + Math.round((OUTPUT_SAMPLE_RATE * x.ms) / 1000), 0);
+  const buf = Buffer.alloc(total * BYTES_PER_SAMPLE);
+
+  let i = 0;
+  for (const note of notes) {
+    const samples = Math.round((OUTPUT_SAMPLE_RATE * note.ms) / 1000);
+    for (let s = 0; s < samples; s++) {
+      // Raised-cosine envelope: a bare sine starting and stopping at full
+      // amplitude clicks at both ends, which is worse than no chime at all.
+      const envelope = 0.5 - 0.5 * Math.cos((2 * Math.PI * s) / samples);
+      const value = Math.sin((2 * Math.PI * note.freq * s) / OUTPUT_SAMPLE_RATE);
+      buf.writeInt16LE(Math.round(value * envelope * 5000), i * BYTES_PER_SAMPLE);
+      i++;
+    }
+  }
+  return buf;
+}
+
 export class SpeakerPlayer {
   private speaker?: PvSpeakerInstance;
   private deviceId = '';
@@ -133,7 +172,16 @@ export class SpeakerPlayer {
   private queue: Buffer[] = [];
   /** Bytes of `queue[0]` already accepted. */
   private headOffset = 0;
+  /** Bytes queued but not yet written — drives the prebuffer decision. */
+  private pendingBytes = 0;
+  /** False until enough audio is banked; see PREBUFFER_BYTES. */
+  private primed = false;
   private retryTimer?: NodeJS.Timeout;
+  /**
+   * Set when the device refuses to open or write. Cleared at the end of a
+   * stream, so one bad utterance cannot mute the rest of the session — which is
+   * what a permanent latch did.
+   */
   private failed = false;
 
   get available(): boolean {
@@ -158,11 +206,37 @@ export class SpeakerPlayer {
     if (pcm.length === 0 || this.failed) {
       return;
     }
+    // Opened now even though nothing is written yet: the open costs ~100 ms, and
+    // spending it during the prebuffer window is free, whereas spending it after
+    // would delay the first word.
     if (!this.open()) {
       return;
     }
     this.queue.push(pcm);
+    this.pendingBytes += pcm.length;
+
+    if (!this.primed && this.pendingBytes < PREBUFFER_BYTES) {
+      return;
+    }
+    this.primed = true;
     this.drain();
+  }
+
+  /**
+   * The stream is complete. Releases whatever is still banked below the
+   * prebuffer threshold — without this a reply shorter than 250 ms would sit in
+   * the queue and never play — and clears any error so the next one can try.
+   */
+  endOfStream(): void {
+    this.primed = true;
+    this.failed = false;
+    this.drain();
+  }
+
+  /** Plays the wake chime. It is complete in one go, so no prebuffering. */
+  playChime(): void {
+    this.enqueue(chimePcm());
+    this.endOfStream();
   }
 
   /**
@@ -173,6 +247,9 @@ export class SpeakerPlayer {
   reset(): void {
     this.queue = [];
     this.headOffset = 0;
+    this.pendingBytes = 0;
+    this.primed = false;
+    this.failed = false;
     this.clearRetry();
     const speaker = this.speaker;
     if (!speaker) {
@@ -190,6 +267,8 @@ export class SpeakerPlayer {
   dispose(): void {
     this.queue = [];
     this.headOffset = 0;
+    this.pendingBytes = 0;
+    this.primed = false;
     this.clearRetry();
     this.close();
   }
@@ -233,8 +312,8 @@ export class SpeakerPlayer {
       this.speaker = speaker;
       return true;
     } catch (err) {
-      // One failure is enough: retrying per chunk would throw dozens of times a
-      // second. The next setDevice() clears this.
+      // One failure is enough for this stream: retrying per chunk would throw
+      // dozens of times a second. endOfStream() clears it.
       this.failed = true;
       pvError = err instanceof Error ? err.message : String(err);
       return false;
@@ -280,6 +359,7 @@ export class SpeakerPlayer {
         pvError = err instanceof Error ? err.message : String(err);
         this.queue = [];
         this.headOffset = 0;
+        this.pendingBytes = 0;
         this.close();
         return;
       }
@@ -287,6 +367,7 @@ export class SpeakerPlayer {
       // Verified empirically: the return is in samples, not bytes.
       const writtenBytes = writtenSamples * BYTES_PER_SAMPLE;
       this.headOffset += writtenBytes;
+      this.pendingBytes = Math.max(0, this.pendingBytes - writtenBytes);
 
       if (this.headOffset >= head.length) {
         this.queue.shift();
