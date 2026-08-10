@@ -190,9 +190,16 @@ export function buildSystemInstruction(language: string): string {
     'read code, file paths or long output aloud; say what changed and let them',
     'read the rest on screen.',
     '',
-    'Answer directly, without the tool, only for greetings, small talk, and',
-    'questions about what you yourself just did. Keep every spoken reply short —',
-    'this is a conversation, not a document.',
+    // Last on purpose. The paragraph above deliberately biases towards calling the
+    // tool, and without an equally concrete counterweight at the end that bias
+    // sends "hello" to a coding agent — which then answers as itself, seconds
+    // later, about something nobody asked.
+    'Do not call it for anything that is not work on the project. Greetings,',
+    '"how are you", thanks, "can you hear me", asking what you just did, asking',
+    'what you can do — answer those yourself, immediately, in one short sentence.',
+    'A greeting is never a task.',
+    '',
+    'Keep every spoken reply short. This is a conversation, not a document.',
   ].join('\n');
 }
 

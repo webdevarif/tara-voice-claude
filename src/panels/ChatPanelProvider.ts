@@ -497,6 +497,29 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       this.flushTaraSpeech();
       this.postMessage({ type: 'TTS_DONE', payload: {} });
     });
+    // Announced once per bridge, not per handshake: the socket now closes when the
+    // mic sleeps and reopens on the next word, so `ready` fires repeatedly during
+    // one conversation.
+    //
+    // This line exists because "which build am I running?" cost a whole debugging
+    // round. A three-word spoken acknowledgement was read as proof the rewrite had
+    // not worked, when it was proof the *old* build was still installed — the
+    // instruction that asked for three words had already been deleted. A session
+    // that states its own shape settles that in one glance.
+    let announced = false;
+    bridge.on('ready', () => {
+      if (announced) {
+        return;
+      }
+      announced = true;
+      const model = config.get<string>('geminiLiveModel') || 'default';
+      const lang = config.get<string>('language', 'auto');
+      this.addSystemMessage(
+        `Live session open — speech-to-speech, ${model}, ` +
+          `language ${lang === 'auto' ? 'auto-detect' : lang}. ` +
+          'Tara answers you directly; Claude Code runs only when she calls for it.'
+      );
+    });
     bridge.on('languageCodeDropped', (why: string) => {
       // Worth saying rather than swallowing: the language still applies, but
       // through the prompt alone, and that is a weaker guarantee than the field.
@@ -805,9 +828,11 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
 
     this.toolCallByAgent.set(agentId, { id: call.id, name: call.name, epoch });
     this.agentByToolCall.set(call.id, agentId);
-    // Shown because the model paraphrases: the user should be able to see what
-    // was actually asked of Claude, not just what they said.
-    this.addSystemMessage(`→ Claude: ${task}`);
+    // Named as a mission because that is what it is: `runTask` puts a card on the
+    // Kanban board, and the answer comes back through it. Shown in full because
+    // the model paraphrases — the user should see what was actually asked of
+    // Claude, not only what they said.
+    this.addSystemMessage(`→ Kanban mission: ${task}`);
   }
 
   /**

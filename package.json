@@ -2,7 +2,7 @@
   "name": "tara-vscode",
   "displayName": "Tara — Voice AI Coding Assistant",
   "description": "Voice-controlled AI coding assistant powered by Gemini Live + Claude Code",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "tara",
   "author": "Tara",
   "license": "MIT",
@@ -145,12 +145,12 @@
         "tara.geminiLiveModel": {
           "type": "string",
           "default": "gemini-3.1-flash-live-preview",
-          "description": "Gemini Live model for speech-to-text and text-to-speech."
+          "description": "Gemini Live model for the speech-to-speech conversation. Must support bidiGenerateContent; a native-audio model gives the best voice."
         },
         "tara.language": {
           "type": "string",
           "default": "auto",
-          "markdownDescription": "Which language Tara listens for and replies in — a BCP-47 code such as `bn-IN`, `en-US` or `hi-IN`, or `auto` to follow whatever you speak. Set it explicitly if you have a strong accent: left on `auto` the model has to guess the language, and a wrong guess is what turns accented speech into garbled English. Applied through the session's system instruction rather than `speechConfig.languageCode`, because native-audio Live models do not accept a language code.",
+          "markdownDescription": "Which language Tara listens for and replies in — a BCP-47 code such as `bn-IN`, `en-US` or `hi-IN`, or `auto` to follow whatever you speak. Set it explicitly if you have a strong accent: left on `auto` the model has to guess the language, and a wrong guess is what turns accented speech into garbled English. Sent both as `speechConfig.languageCode` and as a clause in the session's system instruction; if a model refuses the code, Tara reconnects without it and the instruction alone carries the setting.",
           "description": "Language Tara listens for and replies in (BCP-47 code, or 'auto' to follow the speaker)."
         },
         "tara.voiceName": {
