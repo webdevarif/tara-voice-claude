@@ -114,9 +114,37 @@ export function totalTokens(u: TokenUsage): number {
   );
 }
 
+/**
+ * One thing an agent did, kept so a card can answer "what is it doing?".
+ *
+ * Retained per agent rather than only streamed to the chat: with two agents
+ * running, their lines interleave there, and no amount of reading tells you which
+ * one is on which file.
+ */
+export interface AgentActivity {
+  kind: 'text' | 'tool' | 'result' | 'error' | 'system';
+  text: string;
+  /** Epoch ms. */
+  at: number;
+}
+
 export interface KanbanCard {
   id: string;
+  /** A 60-character label for the column. See `prompt` for what was actually asked. */
   title: string;
+  /**
+   * The full instruction. Kept because `title` is truncated for display, and a
+   * card that cannot show what it was asked to do is the main reason the board
+   * is unreadable once a task is longer than a few words.
+   */
+  prompt: string;
+  /**
+   * The most recent tool line — "Edit page.tsx". One line, on the card, because
+   * elapsed time says a task is running and this says what it is running *on*.
+   */
+  lastActivity?: string;
+  /** Tool calls so far. A rough progress signal where there is no real one. */
+  toolCalls: number;
   status: 'todo' | 'in_progress' | 'needs_input' | 'done' | 'error';
   startedAt?: number;
   completedAt?: number;

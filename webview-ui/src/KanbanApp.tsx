@@ -12,6 +12,11 @@ interface TokenUsage {
 interface KanbanCard {
   id: string;
   title: string;
+  /** The untruncated instruction. `title` is the 60-character label. */
+  prompt: string;
+  /** Most recent tool line — what it is working on right now. */
+  lastActivity?: string;
+  toolCalls: number;
   status: 'todo' | 'in_progress' | 'needs_input' | 'done' | 'error';
   startedAt?: number;
   completedAt?: number;
@@ -171,7 +176,12 @@ export default function KanbanApp() {
                   <span className="kanban-card-icon" style={{ color: col.color }}>
                     {STATUS_ICON[col.id]}
                   </span>
-                  <span className="kanban-card-title">{card.title}</span>
+                  {/* The full prompt on hover: the cheapest possible answer to
+                      "what was this actually asked to do", given the visible
+                      title is cut at 60 characters. */}
+                  <span className="kanban-card-title" title={card.prompt || card.title}>
+                    {card.title}
+                  </span>
                   {(card.status === 'in_progress' || card.status === 'needs_input') && (
                     <button
                       className="kanban-stop-btn"
@@ -186,6 +196,18 @@ export default function KanbanApp() {
 
                 {card.status === 'needs_input' && card.question && (
                   <p className="kanban-card-question">{card.question}</p>
+                )}
+
+                {/* What it is doing, not just that it is doing something. Elapsed
+                    time already says a task is running; this says what it is
+                    running on, which is the question the board could not answer. */}
+                {card.status === 'in_progress' && card.lastActivity && (
+                  <p className="kanban-card-activity" title={card.lastActivity}>
+                    <span className="kanban-activity-arrow" aria-hidden="true">
+                      ↳
+                    </span>
+                    {card.lastActivity}
+                  </p>
                 )}
 
                 <div className="kanban-card-meta">

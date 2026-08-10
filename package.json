@@ -2,7 +2,7 @@
   "name": "tara-vscode",
   "displayName": "Tara — Voice AI Coding Assistant",
   "description": "Voice-controlled AI coding assistant powered by Gemini Live + Claude Code",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "publisher": "tara",
   "author": "Tara",
   "license": "MIT",

@@ -254,6 +254,27 @@
 /* Mute sits beside the orb, not on it. Absolute rather than in the flow so the
    orb stays optically centred — a button in the flow would shift it sideways,
    and the orb is what the eye lands on. */
+/* One line of "what it is doing right now" under a running card. Clipped to a
+   single line: a long path wrapping to three lines would push the cost and model
+   chips off the visible card, and the tooltip carries the full text anyway. */
+.kanban-card-activity {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  margin: 4px 0 0;
+  font-size: var(--text-xs);
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: var(--font-mono, monospace);
+}
+
+.kanban-activity-arrow {
+  flex: none;
+  opacity: 0.6;
+}
+
 .voice-orb-wrapper {
   position: relative;
 }

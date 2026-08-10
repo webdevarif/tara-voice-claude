@@ -4,6 +4,7 @@ import { EventEmitter } from 'events';
 import * as fs from 'fs';
 import * as path from 'path';
 import {
+  AgentActivity,
   AgentStatus,
   KanbanBoard,
   KanbanCard,
@@ -12,6 +13,15 @@ import {
   emptyUsage,
   estimateCostUsd,
 } from '../types';
+
+/**
+ * How much of an agent's history to keep, per agent.
+ *
+ * Bounded because a long task can make hundreds of tool calls and this is held
+ * for the life of the window. 200 is more than anyone scrolls and small enough to
+ * be free.
+ */
+const MAX_ACTIVITY = 200;
 
 export interface AgentOutput {
   type: 'text' | 'tool' | 'result' | 'error' | 'system';
@@ -173,6 +183,15 @@ function looksLikeQuestion(text: string): boolean {
 export class ClaudeCodeRunner extends EventEmitter {
   readonly id: string;
   card: KanbanCard;
+  /**
+   * What this agent has done, oldest first.
+   *
+   * Deliberately excludes `text`: Claude's prose belongs in the chat, arrives in
+   * far greater volume than tool lines, and letting it in would push the tool
+   * lines — the only entries that answer "what is it doing?" — out of a bounded
+   * buffer.
+   */
+  readonly activity: AgentActivity[] = [];
 
   private child?: ChildProcessWithoutNullStreams;
   private _status: AgentStatus = 'idle';
@@ -186,17 +205,42 @@ export class ClaudeCodeRunner extends EventEmitter {
   private lastRateLimitStatus?: string;
   private exited = false;
 
-  constructor(id: string, title: string) {
+  constructor(id: string, title: string, prompt: string) {
     super();
     this.id = id;
     this.card = {
       id,
       title,
+      // Kept whole. `title` is a label; this is what was actually asked, and a
+      // board that cannot show it is unreadable for any task longer than a phrase.
+      prompt,
+      toolCalls: 0,
       status: 'todo',
       usage: emptyUsage(),
       costUsd: 0,
       costIsReported: false,
     };
+  }
+
+  /**
+   * Files one event against this agent.
+   *
+   * Called by the orchestrator rather than from the runner's own emit sites,
+   * which are spread across half a dozen branches — one call at the single point
+   * where output leaves cannot drift out of step with them.
+   */
+  record(data: AgentOutput) {
+    if (data.type === 'text') {
+      return;
+    }
+    if (data.type === 'tool') {
+      this.card.toolCalls += 1;
+      this.card.lastActivity = data.text;
+    }
+    this.activity.push({ kind: data.type, text: data.text, at: Date.now() });
+    if (this.activity.length > MAX_ACTIVITY) {
+      this.activity.splice(0, this.activity.length - MAX_ACTIVITY);
+    }
   }
 
   get status(): AgentStatus {
@@ -711,7 +755,6 @@ export class AgentOrchestrator extends EventEmitter {
     totalCostUsd: 0,
   };
   private idCounter = 0;
-  private _onOutput?: (agentId: string, data: AgentOutput) => void;
   /**
    * The most recent terminal outcome. Runners are never removed from the map
    * (their cards are the Kanban board), so folding over every status made a
@@ -737,8 +780,16 @@ export class AgentOrchestrator extends EventEmitter {
     return vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath ?? process.cwd();
   }
 
+  /**
+   * Subscribes to agent output. Additive — every listener is called.
+   *
+   * This used to assign a single callback, which made a second subscriber
+   * silently *replace* the first. Nothing hit it yet because only the chat
+   * listened, but it is a trap with no symptom: wiring the board up would have
+   * turned the chat transcript off, with no error anywhere to explain why.
+   */
   onOutput(cb: (agentId: string, data: AgentOutput) => void) {
-    this._onOutput = cb;
+    this.on('output', cb);
   }
 
   onKanbanUpdate(cb: (board: KanbanBoard) => void) {
@@ -767,9 +818,18 @@ export class AgentOrchestrator extends EventEmitter {
 
     const id = `agent-${++this.idCounter}`;
     const title = prompt.length > 60 ? prompt.slice(0, 57) + '…' : prompt;
-    const runner = new ClaudeCodeRunner(id, title);
+    const runner = new ClaudeCodeRunner(id, title, prompt);
 
-    runner.on('output', (data: AgentOutput) => this._onOutput?.(id, data));
+    runner.on('output', (data: AgentOutput) => {
+      runner.record(data);
+      // A tool call changes what the card should say it is doing, and nothing
+      // else would push that to the board — cost and status updates are the only
+      // other triggers, and a run can go a long way between those.
+      if (data.type === 'tool') {
+        this.syncBoard();
+      }
+      this.emit('output', id, data);
+    });
     runner.on('costUpdate', () => this.syncBoard());
     runner.on('question', (question: string) => {
       this.syncBoard();
@@ -825,6 +885,16 @@ export class AgentOrchestrator extends EventEmitter {
       return undefined;
     }
     return target.sendReply(text) ? target.id : undefined;
+  }
+
+  /**
+   * One agent's history, oldest first. Empty for an id that never existed.
+   *
+   * Handed out as a copy: the board is a projection, and a consumer holding a
+   * live reference to the buffer would see it mutate under them mid-render.
+   */
+  activityFor(agentId: string): AgentActivity[] {
+    return [...(this.runners.get(agentId)?.activity ?? [])];
   }
 
   hasAgentAwaitingInput(): boolean {
