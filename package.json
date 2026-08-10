@@ -2,7 +2,7 @@
   "name": "tara-vscode",
   "displayName": "Tara — Voice AI Coding Assistant",
   "description": "Voice-controlled AI coding assistant powered by Gemini Live + Claude Code",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "publisher": "tara",
   "author": "Tara",
   "license": "MIT",
@@ -150,8 +150,22 @@
         "tara.language": {
           "type": "string",
           "default": "auto",
-          "markdownDescription": "Which language Tara listens for and replies in — a BCP-47 code such as `bn-IN`, `en-US` or `hi-IN`, or `auto` to follow whatever you speak. Set it explicitly if you have a strong accent: left on `auto` the model has to guess the language, and a wrong guess is what turns accented speech into garbled English. Sent both as `speechConfig.languageCode` and as a clause in the session's system instruction; if a model refuses the code, Tara reconnects without it and the instruction alone carries the setting.",
+          "markdownDescription": "Which language Tara listens for and replies in — for example `bn-BD` (Bengali as spoken in Bangladesh), `bn-IN`, `en-US`, `hi-IN` — or `auto` to follow whatever you speak. Set it explicitly if you have a strong accent: left on `auto` the model has to guess the language, and a wrong guess is what turns accented speech into garbled English.\n\nThe region matters here even though the speech engine ignores it. Only the primary subtag is sent as `speechConfig.languageCode` (`bn-BD` → `bn`), because the published language table has no region variants and sending one it does not list is what made Bengali come back as Hindi. The full code still reaches the model through the system instruction, where \"Bengali (Bangladesh)\" is a meaningful instruction. If a model refuses the code entirely, Tara reconnects without it and the instruction alone carries the setting.",
           "description": "Language Tara listens for and replies in (BCP-47 code, or 'auto' to follow the speaker)."
+        },
+        "tara.persona": {
+          "type": "string",
+          "enum": [
+            "english-teacher",
+            "assistant"
+          ],
+          "enumDescriptions": [
+            "Does the work, and teaches you English alongside it: corrects at most two mistakes after answering, occasionally teaches one word or phrase, and stays quiet while you are mid-task.",
+            "Just does the work. No corrections, no teaching."
+          ],
+          "default": "english-teacher",
+          "markdownDescription": "Who Tara is beyond a voice front-end. `english-teacher` adds coaching **after** she has answered — never instead of answering, and never while you are in the middle of something. Corrections are capped at two per turn so a reply does not become a lesson, and she does not correct you when you speak your own language, only when you are using English.",
+          "description": "Who Tara is: an English teacher who also does the work, or just an assistant."
         },
         "tara.voiceName": {
           "type": "string",

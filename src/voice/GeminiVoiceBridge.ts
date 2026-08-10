@@ -1,5 +1,5 @@
 import { EventEmitter } from 'events';
-import { buildSystemInstruction } from './GeminiCatalog';
+import { Persona, buildSystemInstruction, languageApiCode } from './GeminiCatalog';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GeminiVoiceBridge — raw WebSocket client for the Gemini Live API
@@ -77,6 +77,8 @@ export interface GeminiVoiceOptions {
    * for why it cannot be a config field.
    */
   language?: string;
+  /** Who Tara is beyond a voice front-end — see buildSystemInstruction. */
+  persona?: Persona;
   /** Sample rate of the PCM we send. The recorder produces 16 kHz. */
   inputSampleRate?: number;
 }
@@ -137,6 +139,7 @@ export class GeminiVoiceBridge extends EventEmitter {
   private readonly model: string;
   private readonly voiceName: string;
   private readonly language: string;
+  private readonly persona: Persona;
   private readonly inputSampleRate: number;
 
   /** Frames written before `setupComplete` arrives, replayed in order after. */
@@ -186,6 +189,7 @@ export class GeminiVoiceBridge extends EventEmitter {
     this.model = opts.model?.trim() || GeminiVoiceBridge.DEFAULT_MODEL;
     this.voiceName = opts.voiceName?.trim() || 'Aoede';
     this.language = opts.language?.trim() || 'auto';
+    this.persona = opts.persona ?? 'assistant';
     this.inputSampleRate = opts.inputSampleRate ?? 16000;
   }
 
@@ -359,7 +363,7 @@ export class GeminiVoiceBridge extends EventEmitter {
         inputAudioTranscription: {},
         outputAudioTranscription: {},
         systemInstruction: {
-          parts: [{ text: buildSystemInstruction(this.language) }],
+          parts: [{ text: buildSystemInstruction(this.language, this.persona) }],
         },
       },
     };
@@ -394,7 +398,9 @@ export class GeminiVoiceBridge extends EventEmitter {
     // expresses that by the field being absent; forwarded verbatim it would be a
     // code no locale matches, which is a stricter instruction than none.
     if (this.usingLanguageCode() && !this.dropLanguageCode) {
-      config.languageCode = this.language;
+      // The primary subtag only. `bn-BD` is a useful thing to tell the model and
+      // not a code the speech table contains — see languageApiCode.
+      config.languageCode = languageApiCode(this.language);
     }
     return config;
   }

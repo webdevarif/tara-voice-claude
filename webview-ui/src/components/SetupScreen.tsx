@@ -35,6 +35,7 @@ interface SetupStatus {
   liveModelOptions?: LiveModelOption[];
   language?: string;
   languageOptions?: LanguageOption[];
+  persona?: string;
   speakResponses?: boolean;
   speakerGate?: SpeakerGateProbe;
   /** Whether a Picovoice AccessKey is stored. Never the key itself. */
@@ -108,6 +109,7 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
   const [liveModelOptions, setLiveModelOptions] = useState<LiveModelOption[]>([]);
   const [language, setLanguage] = useState('auto');
   const [languageOptions, setLanguageOptions] = useState<LanguageOption[]>([]);
+  const [persona, setPersona] = useState('english-teacher');
   const [speakResponses, setSpeakResponses] = useState(true);
 
   // ── Only my voice ─────────────────────────────────────────────────────────
@@ -190,6 +192,7 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
       setLiveModelOptions(payload.liveModelOptions ?? []);
       setLanguage(payload.language ?? 'auto');
       setLanguageOptions(payload.languageOptions ?? []);
+      setPersona(payload.persona ?? 'english-teacher');
       setSpeakResponses(payload.speakResponses !== false);
     });
     postToExtension({ type: 'CHECK_SETUP', payload: {} });
@@ -235,6 +238,11 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
   function handleLanguageSelect(code: string) {
     setLanguage(code);
     postToExtension({ type: 'SET_LANGUAGE', payload: { language: code } });
+  }
+
+  function handlePersonaSelect(value: string) {
+    setPersona(value);
+    postToExtension({ type: 'SET_PERSONA', payload: { persona: value } });
   }
 
   function handleSavePvKey() {
@@ -378,6 +386,26 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
               ))}
             </select>
           </div>
+          <div className="setup-mic-select-wrap">
+            <label className="setup-mic-select-label" htmlFor="setup-persona-select">
+              Personality
+            </label>
+            <select
+              id="setup-persona-select"
+              className="setup-select"
+              value={persona}
+              onChange={(e) => handlePersonaSelect(e.target.value)}
+            >
+              <option value="english-teacher">English teacher — teaches while working</option>
+              <option value="assistant">Assistant — just does the work</option>
+            </select>
+          </div>
+          <p className="setup-card-hint">
+            {persona === 'english-teacher'
+              ? 'Corrects at most two English mistakes after answering — never instead of answering, and never while you are mid-task. Occasionally teaches one word or phrase. She will not correct you when you speak your own language.'
+              : 'No corrections and no teaching. Just the work.'}
+          </p>
+
           <p className="setup-card-hint">
             {language === 'auto'
               ? 'Tara replies in whichever language you speak to her in, and switches when you switch.'

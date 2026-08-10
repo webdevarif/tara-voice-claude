@@ -38,6 +38,7 @@ export type TaraMessageType =
   | 'SET_VOICE'               // webview picks a prebuilt Gemini voice
   | 'SET_LIVE_MODEL'          // webview picks the Gemini Live model
   | 'SET_LANGUAGE'            // webview picks the spoken language, or auto-detect
+  | 'SET_PERSONA'             // webview picks who Tara is — plain assistant, or English teacher
   | 'SAVE_PICOVOICE_KEY'      // AccessKey for the speaker gate
   | 'ENROLL_FROM_FILE'        // pick an audio file and learn the owner's voice from it
   | 'ENROLL_START'            // begin learning the owner's voice from the microphone

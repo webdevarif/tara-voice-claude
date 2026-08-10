@@ -40,6 +40,7 @@ import {
   LanguageOption,
   LiveModelOption,
   PREBUILT_VOICES,
+  Persona,
   SPOKEN_LANGUAGES,
   VoiceOption,
   listLiveModels,
@@ -115,6 +116,8 @@ interface SetupStatus {
   /** Current `tara.language` — a code from languageOptions, or 'auto'. */
   language: string;
   languageOptions: LanguageOption[];
+  /** Current `tara.persona`. */
+  persona: string;
   speakResponses: boolean;
   /** Module availability and whether a voice is enrolled. */
   speakerGate: SpeakerGateProbe;
@@ -346,7 +349,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
    * would keep using the old ones until it happened to be replaced.
    */
   private async updateVoiceSetting(
-    key: 'voiceName' | 'geminiLiveModel' | 'speakResponses' | 'language',
+    key: 'voiceName' | 'geminiLiveModel' | 'speakResponses' | 'language' | 'persona',
     value: string | boolean | undefined
   ) {
     if (value === undefined || value === '') {
@@ -1779,6 +1782,12 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         break;
       }
 
+      case 'SET_PERSONA': {
+        const { persona } = msg.payload as { persona?: string };
+        await this.updateVoiceSetting('persona', persona);
+        break;
+      }
+
       case 'SET_SPEAK_RESPONSES': {
         const { enabled } = msg.payload as { enabled?: boolean };
         await this.updateVoiceSetting('speakResponses', !!enabled);
@@ -1969,6 +1978,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       liveModelOptions: [],
       language: config.get<string>('language') || 'auto',
       languageOptions: SPOKEN_LANGUAGES,
+      persona: config.get<string>('persona') || 'english-teacher',
       speakResponses: config.get<boolean>('speakResponses', true),
       speakerGate: probeSpeakerGate(),
       picovoiceKey: !!(await this.picovoiceKey()),

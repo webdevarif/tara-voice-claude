@@ -82,36 +82,57 @@ export const PREBUILT_VOICES: VoiceOption[] = [
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface LanguageOption {
-  /** BCP-47, or 'auto'. Stored verbatim in `tara.language`. */
+  /** Stored verbatim in `tara.language`. May carry a region the API does not know. */
   code: string;
   /** English name, for the picker. */
   label: string;
   /** The language's own name for itself, so a speaker recognises their row. */
   endonym?: string;
+  /**
+   * A language this one keeps being confused with. Named in the instruction,
+   * because a general "use the right language" rule does not stop a specific
+   * substitution — only naming the wrong one does.
+   */
+  avoid?: string;
 }
 
 /**
- * Offered on the setup screen. Not all 70 — a picker nobody can scan is worse
+ * Offered on the setup screen. Not all 86 — a picker nobody can scan is worse
  * than a short list beside a setting that also takes a hand-typed code. Bengali
  * is first after auto-detect because it is the reason this exists.
+ *
+ * Region tags here are for the *user and the model*, not for the API — see
+ * languageApiCode. `bn-BD` and `bn-IN` are one language to the speech engine and
+ * two noticeably different things to speak, which is why both are listed.
  */
 export const SPOKEN_LANGUAGES: LanguageOption[] = [
   { code: 'auto', label: 'Auto-detect' },
-  { code: 'bn-IN', label: 'Bengali', endonym: 'বাংলা' },
+  {
+    code: 'bn-BD',
+    label: 'Bengali (Bangladesh)',
+    endonym: 'বাংলা',
+    avoid: 'Hindi — a different language, and "namaste" is not a Bengali greeting',
+  },
+  {
+    code: 'bn-IN',
+    label: 'Bengali (India)',
+    endonym: 'বাংলা',
+    avoid: 'Hindi — a different language, however close the two sound',
+  },
   { code: 'en-US', label: 'English' },
-  { code: 'hi-IN', label: 'Hindi', endonym: 'हिन्दी' },
-  { code: 'ur-PK', label: 'Urdu', endonym: 'اردو' },
+  { code: 'hi-IN', label: 'Hindi', endonym: 'हिन्दी', avoid: 'Urdu, and Bengali' },
+  { code: 'ur-PK', label: 'Urdu', endonym: 'اردو', avoid: 'Hindi' },
   { code: 'ar-XA', label: 'Arabic', endonym: 'العربية' },
-  { code: 'es-ES', label: 'Spanish', endonym: 'Español' },
+  { code: 'es-ES', label: 'Spanish', endonym: 'Español', avoid: 'Portuguese' },
   { code: 'fr-FR', label: 'French', endonym: 'Français' },
   { code: 'de-DE', label: 'German', endonym: 'Deutsch' },
-  { code: 'pt-BR', label: 'Portuguese', endonym: 'Português' },
+  { code: 'pt-BR', label: 'Portuguese', endonym: 'Português', avoid: 'Spanish' },
   { code: 'ru-RU', label: 'Russian', endonym: 'Русский' },
   { code: 'tr-TR', label: 'Turkish', endonym: 'Türkçe' },
-  { code: 'id-ID', label: 'Indonesian', endonym: 'Bahasa Indonesia' },
+  { code: 'id-ID', label: 'Indonesian', endonym: 'Bahasa Indonesia', avoid: 'Malay' },
   { code: 'ta-IN', label: 'Tamil', endonym: 'தமிழ்' },
   { code: 'te-IN', label: 'Telugu', endonym: 'తెలుగు' },
-  { code: 'mr-IN', label: 'Marathi', endonym: 'मराठी' },
+  { code: 'mr-IN', label: 'Marathi', endonym: 'मराठी', avoid: 'Hindi' },
   { code: 'ja-JP', label: 'Japanese', endonym: '日本語' },
   { code: 'ko-KR', label: 'Korean', endonym: '한국어' },
   { code: 'cmn-CN', label: 'Chinese (Mandarin)', endonym: '中文' },
@@ -127,6 +148,32 @@ export function languageLabel(code: string): string {
   const trimmed = (code || '').trim();
   const known = SPOKEN_LANGUAGES.find((l) => l.code === trimmed);
   return known ? known.label : trimmed;
+}
+
+/** The language this one is most often mistaken for, if it has such a neighbour. */
+export function languageAvoid(code: string): string {
+  return SPOKEN_LANGUAGES.find((l) => l.code === (code || '').trim())?.avoid ?? '';
+}
+
+/**
+ * What belongs in `speechConfig.languageCode`: the primary subtag alone.
+ *
+ * The published speech-generation table lists Bengali as `bn` — no region
+ * variants, and the same across all 86 entries. Sending `bn-IN` therefore names
+ * something that table does not contain, and the observed result was the model
+ * drifting into Hindi and greeting in it. A working implementation against this
+ * same model sends the bare subtag, which agrees with the table.
+ *
+ * The region is not wasted: it still reaches the model through the system
+ * instruction, where "Bengali (Bangladesh)" is a meaningful thing to be told even
+ * though `bn-BD` is not a meaningful code to send.
+ */
+export function languageApiCode(code: string): string {
+  const trimmed = (code || '').trim();
+  if (!trimmed || trimmed.toLowerCase() === 'auto') {
+    return '';
+  }
+  return trimmed.split(/[-_]/)[0].toLowerCase();
 }
 
 /**
@@ -146,9 +193,54 @@ export function languageLabel(code: string): string {
  * prompt for Claude Code, whose codebase, identifiers and own instructions are
  * English.
  */
-export function buildSystemInstruction(language: string): string {
+/**
+ * Who Tara is, beyond being a voice front-end.
+ *
+ * `english-teacher` is a real second job rather than a costume: it changes what
+ * she does after answering, which is why it needs its own instructions and its
+ * own rule about when to stay quiet. Without that last part a coaching persona
+ * becomes unusable — nobody debugging at speed wants a grammar lesson mid-thought.
+ */
+export type Persona = 'assistant' | 'english-teacher';
+
+const TEACHER_BLOCK = [
+  'You are also this user’s English teacher. They asked for that, so it is part of',
+  'the job, not an intrusion — but their work always comes first.',
+  '',
+  'After you have answered, and only then, you may do one of these:',
+  '- Correct their English. Pick at most two mistakes worth fixing — grammar, word',
+  '  choice, a phrase no native speaker would say. Say what they said, say the',
+  '  better version, give one short reason, and move on. Never more than two, and',
+  '  never instead of answering.',
+  '- Teach one small thing: a word that would have fitted, a phrase for the',
+  '  situation they are in, or the difference between two words they are likely to',
+  '  mix up. One thing, briefly.',
+  '- Say nothing about English at all. This is usually the right choice.',
+  '',
+  'When to stay quiet, which matters more than when to teach: if they are in the',
+  'middle of something, debugging, waiting on a task, or clearly in a hurry, let',
+  'the slips go and correct them later. A lesson delivered at the wrong moment is',
+  'worse than no lesson.',
+  '',
+  'When they speak their own language rather than English, do not correct that —',
+  'they are not practising then. If they are plainly trying out English, be warmer',
+  'and more encouraging than usual, and notice real improvement once, specifically,',
+  'rather than praising everything.',
+].join('\n');
+
+/**
+ * `persona` defaults to the same value as the `tara.persona` setting, on purpose.
+ * Two defaults in two places is a bug waiting to happen: a caller that forgot to
+ * pass one would silently build a plain assistant while the user's settings said
+ * teacher, and nothing would report the disagreement.
+ */
+export function buildSystemInstruction(
+  language: string,
+  persona: Persona = 'english-teacher'
+): string {
   const code = (language || 'auto').trim();
   const name = code === 'auto' ? '' : languageLabel(code);
+  const avoid = languageAvoid(code);
 
   const languageRule = name
     ? `This user's language is ${name}. Understand them as ${name} — never as some ` +
@@ -157,6 +249,13 @@ export function buildSystemInstruction(language: string): string {
       `That includes errors and refusals. If they ask you outright to use a ` +
       `different language, do it from that message onward; a request made once is ` +
       `enough and does not have to be repeated.\n` +
+      // A general "use the right language" rule demonstrably does not stop a
+      // specific substitution: with only that, Bengali came back as Hindi, greeting
+      // with "namaste". Naming the wrong language is what stops it.
+      (avoid
+        ? `Do not slip into ${avoid}. Do not borrow its greetings or its words ` +
+          `because they seem close enough.\n`
+        : '') +
       // Without this the rule gets read as being about substance: a request in
       // Bengali came back as a *different answer* rather than the same answer in
       // Bengali. It is a rule about wording only.
@@ -164,8 +263,11 @@ export function buildSystemInstruction(language: string): string {
       `should be answered differently, only written differently.`
     : 'Reply in whichever language the user speaks to you in, and switch when ' +
       'they switch. Never answer in a different language from the one you were ' +
-      'just addressed in. This is about wording, not substance — the language ' +
-      'someone asks in never changes what the right answer is.';
+      'just addressed in. Never substitute a language that merely sounds similar ' +
+      'to theirs. This is about wording, not substance — the language someone ' +
+      'asks in never changes what the right answer is.';
+
+  const tail = persona === 'english-teacher' ? ['', TEACHER_BLOCK] : [];
 
   return [
     'You are Tara, a voice assistant built into VS Code. You are talking with a',
@@ -200,6 +302,7 @@ export function buildSystemInstruction(language: string): string {
     'A greeting is never a task.',
     '',
     'Keep every spoken reply short. This is a conversation, not a document.',
+    ...tail,
   ].join('\n');
 }
 
